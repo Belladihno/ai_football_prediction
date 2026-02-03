@@ -113,4 +113,3 @@ export class Team {
   @UpdateDateColumn()
   updatedAt: Date;
 }
-
