@@ -8,7 +8,7 @@ import {
 import { TeamService } from '../services/team.service';
 import { Team } from '../entities/team.entity';
 
-@Controller('api/teams')
+@Controller('teams')
 export class TeamController {
   private readonly logger = new Logger(TeamController.name);
 
@@ -51,3 +51,4 @@ export class TeamController {
     };
   }
 }
+

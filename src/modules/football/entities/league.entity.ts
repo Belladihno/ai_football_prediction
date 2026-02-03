@@ -10,6 +10,7 @@ import {
 // Forward declarations to avoid circular imports
 import type { Team } from './team.entity';
 import type { Fixture } from './fixture.entity';
+import type { Standing } from './standing.entity';
 
 @Entity('leagues')
 export class League {
@@ -45,6 +46,9 @@ export class League {
 
   @OneToMany('Fixture', (fixture: Fixture) => fixture.league)
   fixtures: Fixture[];
+
+  @OneToMany('Standing', (standing: Standing) => standing.league)
+  standings: Standing[];
 
   @CreateDateColumn()
   createdAt: Date;

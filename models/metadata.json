@@ -1,0 +1,52 @@
+{
+  "model_name": "random_forest_v1",
+  "model_type": "random_forest",
+  "version": "1.0.0",
+  "created_at": "2026-02-03T01:51:41.456012",
+  "metrics": {
+    "accuracy": 0.497,
+    "brier_score": 0.6070073423405621,
+    "log_loss": 1.0003702571736994
+  },
+  "features": {
+    "count": 31,
+    "names": [
+      "home_form_score",
+      "away_form_score",
+      "home_points_per_game",
+      "away_points_per_game",
+      "home_goals_per_game",
+      "away_goals_per_game",
+      "home_league_position",
+      "away_league_position",
+      "home_goal_difference",
+      "away_goal_difference",
+      "home_xg",
+      "away_xg",
+      "h2h_form_score",
+      "home_h2h_wins",
+      "h2h_avg_goals",
+      "home_advantage",
+      "home_rest_days",
+      "away_rest_days",
+      "home_injury_count",
+      "away_injury_count",
+      "home_injury_impact",
+      "away_injury_impact",
+      "home_win_streak",
+      "away_win_streak",
+      "home_unbeaten_streak",
+      "away_unbeaten_streak",
+      "home_manager_tenure",
+      "away_manager_tenure",
+      "weather_impact",
+      "temperature",
+      "market_home_prob"
+    ]
+  },
+  "classes": [
+    "HOME",
+    "DRAW",
+    "AWAY"
+  ]
+}

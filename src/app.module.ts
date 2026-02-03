@@ -10,6 +10,7 @@ import { SyncModule } from './modules/sync/sync.module';
 import { League } from './modules/football/entities/league.entity';
 import { Team } from './modules/football/entities/team.entity';
 import { Fixture } from './modules/football/entities/fixture.entity';
+import { Standing } from './modules/football/entities/standing.entity';
 
 @Module({
   imports: [
@@ -33,7 +34,7 @@ import { Fixture } from './modules/football/entities/fixture.entity';
         username: configService.get<string>('database.username'),
         password: configService.get<string>('database.password'),
         database: configService.get<string>('database.name'),
-        entities: [League, Team, Fixture],
+        entities: [League, Team, Fixture, Standing],
         synchronize: configService.get<boolean>('database.synchronize'),
         logging: configService.get<boolean>('database.logging'),
       }),
@@ -46,4 +47,4 @@ import { Fixture } from './modules/football/entities/fixture.entity';
   controllers: [AppController],
   providers: [AppService],
 })
-export class AppModule {}
+export class AppModule { }

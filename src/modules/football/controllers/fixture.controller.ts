@@ -18,7 +18,7 @@ interface FixtureQueryDto {
   limit?: number;
 }
 
-@Controller('api/fixtures')
+@Controller('fixtures')
 export class FixtureController {
   private readonly logger = new Logger(FixtureController.name);
 

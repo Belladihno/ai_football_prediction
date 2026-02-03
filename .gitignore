@@ -54,3 +54,24 @@ pids
 
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Python ML Environment
+ml/ml_venv/
+ml_venv/
+venv/
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# ML Models (generated, can be large)
+ml/models/*.onnx
+ml/models/*.json
+ml/training_results.json
+
