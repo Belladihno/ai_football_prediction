@@ -7,10 +7,15 @@ import { AppService } from './app.service';
 import configuration from './config/configuration';
 import { FootballModule } from './modules/football/football.module';
 import { SyncModule } from './modules/sync/sync.module';
+import { QueueModule } from './modules/queue/queue.module';
+import { PredictionsModule } from './modules/predictions/predictions.module';
 import { League } from './modules/football/entities/league.entity';
 import { Team } from './modules/football/entities/team.entity';
 import { Fixture } from './modules/football/entities/fixture.entity';
 import { Standing } from './modules/football/entities/standing.entity';
+import { Prediction } from './modules/predictions/entities/prediction.entity';
+import { ModelMetrics } from './modules/ml-monitoring/entities/model-metrics.entity';
+import { Injury } from './modules/football/entities/injury.entity';
 
 @Module({
   imports: [
@@ -23,6 +28,9 @@ import { Standing } from './modules/football/entities/standing.entity';
     // Scheduling
     ScheduleModule.forRoot(),
 
+    // Bull Queue (Redis-based background jobs) - Global module
+    QueueModule,
+
     // TypeORM PostgreSQL
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
@@ -34,7 +42,7 @@ import { Standing } from './modules/football/entities/standing.entity';
         username: configService.get<string>('database.username'),
         password: configService.get<string>('database.password'),
         database: configService.get<string>('database.name'),
-        entities: [League, Team, Fixture, Standing],
+        entities: [League, Team, Fixture, Standing, Prediction, ModelMetrics, Injury],
         synchronize: configService.get<boolean>('database.synchronize'),
         logging: configService.get<boolean>('database.logging'),
       }),
@@ -43,6 +51,7 @@ import { Standing } from './modules/football/entities/standing.entity';
     // Feature modules
     FootballModule,
     SyncModule,
+    PredictionsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { FootballDataApiService } from './football-data-api.service';
+import { FootballDataOrgService } from './football-data-org.service';
 import { WeatherApiService, WeatherData } from './weather-api.service';
 import { OddsApiService, OddsData } from './odds-api.service';
 import { InjuryService } from './injury.service';
@@ -75,7 +75,7 @@ export class DataAggregatorService {
   private readonly logger = new Logger(DataAggregatorService.name);
 
   constructor(
-    private footballApi: FootballDataApiService,
+    private footballData: FootballDataOrgService,
     private weatherService: WeatherApiService,
     private oddsService: OddsApiService,
     private injuryService: InjuryService,
@@ -98,17 +98,17 @@ export class DataAggregatorService {
       return cached;
     }
 
-    // Fetch all data in parallel
-    const [fixture, weather, odds, injuries] = await Promise.all([
-      this.footballApi.getFixture(fixtureId),
-      this.getCachedWeather(venue),
-      this.getCachedOdds(fixtureId, leagueCode),
-      this.getInjuriesForMatch(leagueCode),
-    ]);
-
+    const fixture = await this.footballData.getMatch(fixtureId);
     if (!fixture) {
       throw new Error(`Fixture ${fixtureId} not found`);
     }
+
+    // Fetch remaining data in parallel (requires fixture context for odds)
+    const [weather, odds, injuries] = await Promise.all([
+      this.getCachedWeather(venue),
+      this.getCachedOdds(fixtureId, leagueCode, fixture.homeTeam.name, fixture.awayTeam.name, new Date(fixture.utcDate)),
+      this.getInjuriesForMatch(leagueCode),
+    ]);
 
     // Build aggregated data
     const homeTeam = fixture.homeTeam;
@@ -162,12 +162,15 @@ export class DataAggregatorService {
 
     // Get H2H data
     try {
-      const h2hMatches = await this.footballApi.getTeamMatches(homeTeam.id, { limit: 10 });
-      const relevantH2H = h2hMatches.filter(
-        m => m.status === 'FINISHED' &&
-        ((m.homeTeam.id === homeTeam.id && m.awayTeam.id === awayTeam.id) ||
-         (m.homeTeam.id === awayTeam.id && m.awayTeam.id === homeTeam.id))
-      );
+      const h2hMatches = await this.footballData.getTeamMatches(homeTeam.id, 'FINISHED');
+      const relevantH2H = (h2hMatches || [])
+        .filter(
+          m =>
+            m.status === 'FINISHED' &&
+            ((m.homeTeam.id === homeTeam.id && m.awayTeam.id === awayTeam.id) ||
+              (m.homeTeam.id === awayTeam.id && m.awayTeam.id === homeTeam.id)),
+        )
+        .slice(0, 10);
 
       let homeWins = 0;
       let awayWins = 0;
@@ -193,15 +196,19 @@ export class DataAggregatorService {
         awayWins,
         draws,
         avgGoals: relevantH2H.length > 0 ? totalGoals / relevantH2H.length : 2.5,
-        lastFiveResults: relevantH2H.slice(0, 5).map(m => {
-          const isHomeTeam = m.homeTeam.id === homeTeam.id;
-          const homeGoals = isHomeTeam ? m.score.fullTime.home! : m.score.fullTime.away!;
-          const awayGoals = isHomeTeam ? m.score.fullTime.away! : m.score.fullTime.home!;
+        lastFiveResults: relevantH2H
+          .slice(0, 5)
+          .map(m => {
+            const isHomeTeam = m.homeTeam.id === homeTeam.id;
+            const homeGoals = isHomeTeam ? m.score.fullTime.home! : m.score.fullTime.away!;
+            const awayGoals = isHomeTeam ? m.score.fullTime.away! : m.score.fullTime.home!;
 
-          if (homeGoals > awayGoals) return isHomeTeam ? 'W' : 'L';
-          if (homeGoals < awayGoals) return isHomeTeam ? 'L' : 'W';
-          return 'D';
-        }).reverse().join(''),
+            if (homeGoals > awayGoals) return isHomeTeam ? 'W' : 'L';
+            if (homeGoals < awayGoals) return isHomeTeam ? 'L' : 'W';
+            return 'D';
+          })
+          .reverse()
+          .join(''),
       };
     } catch (error) {
       this.logger.warn(`Could not fetch H2H data: ${error.message}`);
@@ -231,12 +238,18 @@ export class DataAggregatorService {
   /**
    * Get odds with caching
    */
-  private async getCachedOdds(fixtureId: number, leagueCode: string): Promise<OddsData | null> {
+  private async getCachedOdds(
+    fixtureId: number,
+    leagueCode: string,
+    homeTeam: string,
+    awayTeam: string,
+    kickoff: Date,
+  ): Promise<OddsData | null> {
     const cacheKey = `odds:${fixtureId}`;
     const cached = await this.cacheService.get<OddsData>(cacheKey);
     if (cached) return cached;
 
-    const odds = await this.oddsService.getOddsForFixture(fixtureId, leagueCode);
+    const odds = await this.oddsService.getOddsForFixture(fixtureId, leagueCode, homeTeam, awayTeam, kickoff);
     if (odds) {
       await this.cacheService.set(cacheKey, odds, 43200); // 12 hours
     }

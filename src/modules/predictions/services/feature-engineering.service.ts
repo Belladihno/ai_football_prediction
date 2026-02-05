@@ -1,14 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
-import { Fixture } from '../../football/entities/fixture.entity';
-import { Team } from '../../football/entities/team.entity';
+import { Fixture, FixtureStatus } from '../../football/entities/fixture.entity';
 import { Standing } from '../../football/entities/standing.entity';
-import { TeamService } from '../../football/services/team.service';
+import { DataQualityService } from '../../data-quality/services/data-quality.service';
 import { InjuryService } from '../../football/services/injury.service';
-import { WeatherApiService } from '../../football/services/weather-api.service';
-import { OddsApiService } from '../../football/services/odds-api.service';
-import { FootballDataApiService } from '../../football/services/football-data-api.service';
 
 export interface MatchFeatures {
   // Form features (6)
@@ -66,23 +62,35 @@ export interface MatchFeatures {
   lastUpdated: Date;
 }
 
+interface LeagueTableEntry {
+  position: number;
+  played: number;
+  pointsPerGame: number;
+  goalsForPerGame: number;
+  goalsAgainstPerGame: number;
+  goalDifference: number;
+}
+
+interface LeagueTableCacheEntry {
+  expiresAt: number;
+  tableByTeamId: Map<string, LeagueTableEntry>;
+}
+
 @Injectable()
 export class FeatureEngineeringService {
   private readonly logger = new Logger(FeatureEngineeringService.name);
+  private readonly leagueTableTtlMs = 15 * 60 * 1000; // 15 minutes
+  private readonly leagueTableCache = new Map<string, LeagueTableCacheEntry>();
+  private readonly standingsCache = new Map<string, { expiresAt: number; map: Map<string, Standing> }>();
 
   constructor(
     @InjectRepository(Fixture)
     private fixtureRepository: Repository<Fixture>,
-    @InjectRepository(Team)
-    private teamRepository: Repository<Team>,
     @InjectRepository(Standing)
     private standingRepository: Repository<Standing>,
-    private teamService: TeamService,
+    private dataQualityService: DataQualityService,
     private injuryService: InjuryService,
-    private weatherService: WeatherApiService,
-    private oddsService: OddsApiService,
-    private footballApi: FootballDataApiService,
-  ) {}
+  ) { }
 
   /**
    * Extract all features for a fixture
@@ -97,7 +105,7 @@ export class FeatureEngineeringService {
       throw new Error(`Fixture ${fixtureId} not found`);
     }
 
-    // Start building features
+    // Start building features with defaults
     const features: MatchFeatures = {
       fixtureId,
       leagueCode: fixture.league?.code || '',
@@ -129,7 +137,7 @@ export class FeatureEngineeringService {
       daysSinceLastMatchHome: 7,
       daysSinceLastMatchAway: 7,
 
-      // Injury features
+      // Injury features (defaults - no external service)
       homeInjuriesCount: 0,
       awayInjuriesCount: 0,
       homeInjuryImpact: 0,
@@ -145,101 +153,165 @@ export class FeatureEngineeringService {
       homeManagerTenure: 365,
       awayManagerTenure: 365,
 
-      // Environmental features
+      // Environmental features (defaults - no external service)
       weatherImpact: 0,
       temperature: 15,
 
-      // Market feature
+      // Market feature (defaults - no external service)
       marketHomeProb: 0.45,
     };
 
-    // Get form data from API
-    try {
-      features.homeLastFiveResults = await this.teamService.getForm(fixture.homeTeamId, 5);
-      features.awayLastFiveResults = await this.teamService.getForm(fixture.awayTeamId, 5);
-    } catch (error) {
-      this.logger.warn(`Could not fetch form data: ${error.message}`);
-    }
+    const kickoff = fixture.kickoff;
+    const seasonStart = this.getSeasonStartDate(kickoff);
 
-    // Get standing data
+    // Get recent fixtures (from our DB, synced from football-data.org)
+    const [homeRecent, awayRecent] = await Promise.all([
+      this.getRecentFinishedFixtures(fixture.homeTeamId, kickoff, 10),
+      this.getRecentFinishedFixtures(fixture.awayTeamId, kickoff, 10),
+    ]);
+
+    // Form + streaks + basic stats (DB-derived)
+    const homeStats = this.computeTeamStatsFromFixtures(fixture.homeTeamId, homeRecent, kickoff);
+    const awayStats = this.computeTeamStatsFromFixtures(fixture.awayTeamId, awayRecent, kickoff);
+
+    features.homeLastFiveResults = homeStats.lastFiveForm;
+    features.awayLastFiveResults = awayStats.lastFiveForm;
+    features.homeWinStreak = homeStats.winStreak;
+    features.awayWinStreak = awayStats.winStreak;
+    features.homeUnbeatenStreak = homeStats.unbeatenStreak;
+    features.awayUnbeatenStreak = awayStats.unbeatenStreak;
+    features.daysSinceLastMatchHome = homeStats.daysSinceLastMatch ?? features.daysSinceLastMatchHome;
+    features.daysSinceLastMatchAway = awayStats.daysSinceLastMatch ?? features.daysSinceLastMatchAway;
+    features.homeGoalsScoredPerGame = homeStats.goalsForPerGame;
+    features.awayGoalsScoredPerGame = awayStats.goalsForPerGame;
+
+    // Use points per game from recent data as a fallback
+    features.homePointsPerGame = homeStats.pointsPerGame;
+    features.awayPointsPerGame = awayStats.pointsPerGame;
+
+    // Season-to-date strength features from standings (preferred) or computed table
     try {
-      const homeStanding = await this.standingRepository.findOne({
-        where: { teamId: fixture.homeTeamId },
-        order: { position: 'ASC' },
-      });
-      const awayStanding = await this.standingRepository.findOne({
-        where: { teamId: fixture.awayTeamId },
-        order: { position: 'ASC' },
-      });
+      const standings = await this.getStandingsCached(fixture.leagueId);
+      const homeStanding = standings.get(fixture.homeTeamId);
+      const awayStanding = standings.get(fixture.awayTeamId);
 
       if (homeStanding) {
+        const played = homeStanding.playedGames || homeStanding.gamesPlayed || 0;
         features.homeLeaguePosition = homeStanding.position;
         features.homeGoalDifference = homeStanding.goalDifference;
-        features.homePointsPerGame = homeStanding.points / Math.max(homeStanding.gamesPlayed, 1);
+        features.homePointsPerGame = played > 0 ? homeStanding.points / played : features.homePointsPerGame;
+        features.homeGoalsScoredPerGame = played > 0 ? homeStanding.goalsFor / played : features.homeGoalsScoredPerGame;
       }
-
       if (awayStanding) {
+        const played = awayStanding.playedGames || awayStanding.gamesPlayed || 0;
         features.awayLeaguePosition = awayStanding.position;
         features.awayGoalDifference = awayStanding.goalDifference;
-        features.awayPointsPerGame = awayStanding.points / Math.max(awayStanding.gamesPlayed, 1);
+        features.awayPointsPerGame = played > 0 ? awayStanding.points / played : features.awayPointsPerGame;
+        features.awayGoalsScoredPerGame = played > 0 ? awayStanding.goalsFor / played : features.awayGoalsScoredPerGame;
       }
-    } catch (error) {
-      this.logger.warn(`Could not fetch standing data: ${error.message}`);
-    }
 
-    // Get team goals per game
-    const homeTeam = fixture.homeTeam;
-    const awayTeam = fixture.awayTeam;
+      let tableHome: LeagueTableEntry | undefined;
+      let tableAway: LeagueTableEntry | undefined;
+      if (!homeStanding || !awayStanding) {
+        const table = await this.getLeagueTableCached(fixture.leagueId, seasonStart, kickoff);
+        tableHome = table.tableByTeamId.get(fixture.homeTeamId);
+        tableAway = table.tableByTeamId.get(fixture.awayTeamId);
 
-    if (homeTeam) {
-      features.homeGoalsScoredPerGame = homeTeam.goalsScoredPerGame || 0;
-    }
-    if (awayTeam) {
-      features.awayGoalsScoredPerGame = awayTeam.goalsScoredPerGame || 0;
-    }
-
-    // Get H2H data
-    try {
-      const h2hMatches = await this.footballApi.getTeamMatches(
-        fixture.homeTeam.externalId,
-        { limit: 10 },
-      );
-
-      const relevantH2H = h2hMatches.filter(
-        m => m.status === 'FINISHED' &&
-        ((m.homeTeam.id === fixture.homeTeam.externalId && m.awayTeam.id === fixture.awayTeam.externalId) ||
-         (m.homeTeam.id === fixture.awayTeam.externalId && m.awayTeam.id === fixture.homeTeam.externalId))
-      );
-
-      let homeWins = 0;
-      let awayWins = 0;
-      let totalGoals = 0;
-
-      for (const match of relevantH2H.slice(0, 5)) {
-        const isHomeTeam = match.homeTeam.id === fixture.homeTeam.externalId;
-        const homeGoals = isHomeTeam ? match.score.fullTime.home! : match.score.fullTime.away!;
-        const awayGoals = isHomeTeam ? match.score.fullTime.away! : match.score.fullTime.home!;
-
-        totalGoals += homeGoals + awayGoals;
-
-        if (homeGoals > awayGoals) {
-          isHomeTeam ? homeWins++ : awayWins++;
+        if (!homeStanding && tableHome) {
+          features.homeLeaguePosition = tableHome.position;
+          features.homeGoalDifference = tableHome.goalDifference;
+          features.homePointsPerGame = tableHome.pointsPerGame;
+          features.homeGoalsScoredPerGame = tableHome.goalsForPerGame;
+        }
+        if (!awayStanding && tableAway) {
+          features.awayLeaguePosition = tableAway.position;
+          features.awayGoalDifference = tableAway.goalDifference;
+          features.awayPointsPerGame = tableAway.pointsPerGame;
+          features.awayGoalsScoredPerGame = tableAway.goalsForPerGame;
         }
       }
 
-      features.homeH2HWins = homeWins;
-      features.h2hTotalGoalsAvg = relevantH2H.length > 0 ? totalGoals / relevantH2H.length : 2.5;
-      features.h2hLast5 = relevantH2H.slice(0, 5).map(m => {
-        const isHomeTeam = m.homeTeam.id === fixture.homeTeam.externalId;
-        const homeGoals = isHomeTeam ? m.score.fullTime.home! : m.score.fullTime.away!;
-        const awayGoals = isHomeTeam ? m.score.fullTime.away! : m.score.fullTime.home!;
+      const homeFor = homeStanding
+        ? (homeStanding.playedGames || homeStanding.gamesPlayed || 0) > 0 ? homeStanding.goalsFor / (homeStanding.playedGames || homeStanding.gamesPlayed) : homeStats.goalsForPerGame
+        : tableHome?.goalsForPerGame ?? homeStats.goalsForPerGame;
+      const homeAgainst = homeStanding
+        ? (homeStanding.playedGames || homeStanding.gamesPlayed || 0) > 0 ? homeStanding.goalsAgainst / (homeStanding.playedGames || homeStanding.gamesPlayed) : homeStats.goalsAgainstPerGame
+        : tableHome?.goalsAgainstPerGame ?? homeStats.goalsAgainstPerGame;
+      const awayFor = awayStanding
+        ? (awayStanding.playedGames || awayStanding.gamesPlayed || 0) > 0 ? awayStanding.goalsFor / (awayStanding.playedGames || awayStanding.gamesPlayed) : awayStats.goalsForPerGame
+        : tableAway?.goalsForPerGame ?? awayStats.goalsForPerGame;
+      const awayAgainst = awayStanding
+        ? (awayStanding.playedGames || awayStanding.gamesPlayed || 0) > 0 ? awayStanding.goalsAgainst / (awayStanding.playedGames || awayStanding.gamesPlayed) : awayStats.goalsAgainstPerGame
+        : tableAway?.goalsAgainstPerGame ?? awayStats.goalsAgainstPerGame;
 
-        if (homeGoals > awayGoals) return isHomeTeam ? 'W' : 'L';
-        if (homeGoals < awayGoals) return isHomeTeam ? 'L' : 'W';
-        return 'D';
-      }).reverse().join('');
+      // Expected goals proxy (football-data.org doesn't provide xG)
+      features.homeExpectedGoals = this.clampNumber(((homeFor + awayAgainst) / 2) * 1.05, 0.2, 4);
+      features.awayExpectedGoals = this.clampNumber((awayFor + homeAgainst) / 2, 0.2, 4);
+    } catch (error) {
+      this.logger.warn(`Could not compute league table: ${error.message}`);
+      // Fallback expected goals proxy from recent stats
+      features.homeExpectedGoals = this.clampNumber(((homeStats.goalsForPerGame + awayStats.goalsAgainstPerGame) / 2) * 1.05, 0.2, 4);
+      features.awayExpectedGoals = this.clampNumber((awayStats.goalsForPerGame + homeStats.goalsAgainstPerGame) / 2, 0.2, 4);
+    }
+
+    // Head-to-head from our DB (synced from football-data.org)
+    try {
+      const h2h = await this.getHeadToHeadFromDb(fixture.homeTeamId, fixture.awayTeamId, kickoff, 10);
+      features.h2hLast5 = h2h.lastFiveForm;
+      features.homeH2HWins = h2h.homeWinsLast5;
+      features.h2hTotalGoalsAvg = h2h.avgTotalGoalsLast5;
     } catch (error) {
       this.logger.warn(`Could not fetch H2H data: ${error.message}`);
+    }
+
+    // Injuries (DB-backed, PL from FPL sync; non-PL from manual entries)
+    try {
+      const [homeInjury, awayInjury] = await Promise.all([
+        this.injuryService.getTeamInjurySummary(fixture.homeTeamId),
+        this.injuryService.getTeamInjurySummary(fixture.awayTeamId),
+      ]);
+
+      features.homeInjuriesCount = homeInjury.count;
+      features.awayInjuriesCount = awayInjury.count;
+      features.homeInjuryImpact = homeInjury.impact;
+      features.awayInjuryImpact = awayInjury.impact;
+    } catch (error) {
+      this.logger.warn(`Could not fetch injury data: ${error.message}`);
+    }
+
+    // Market baseline proxy (no odds API): map points-per-game difference to a rough home win prior
+    const ppgDiff = (features.homePointsPerGame || 0) - (features.awayPointsPerGame || 0);
+    features.marketHomeProb = this.clampNumber(0.5 + ppgDiff * 0.12 + 0.03, 0.2, 0.8);
+
+    // Data quality validation (helps confidence scoring + debugging)
+    try {
+      const homeFormStats = this.formStringToStats(features.homeLastFiveResults);
+      const awayFormStats = this.formStringToStats(features.awayLastFiveResults);
+      const h2hStats = this.formStringToStats(features.h2hLast5);
+      const validation = this.dataQualityService.validateFeatures({
+        homeTeamId: fixture.homeTeamId,
+        awayTeamId: fixture.awayTeamId,
+        leagueCode: features.leagueCode,
+        homeForm: homeFormStats,
+        awayForm: awayFormStats,
+        homeGoalsPerGame: features.homeGoalsScoredPerGame,
+        awayGoalsPerGame: features.awayGoalsScoredPerGame,
+        h2hData: {
+          matchesPlayed: h2hStats.gamesPlayed,
+          homeWins: h2hStats.wins,
+          awayWins: h2hStats.losses,
+          draws: h2hStats.draws,
+        },
+        lastUpdated: features.lastUpdated,
+      });
+
+      if (!validation.isValid || validation.issues.length > 0) {
+        this.logger.warn(
+          `Feature quality for fixture ${fixtureId}: confidence=${validation.confidence.toFixed(2)} issues=${validation.issues.join('; ')}`,
+        );
+      }
+    } catch (error) {
+      this.logger.warn(`Could not validate feature quality: ${error.message}`);
     }
 
     return features;
@@ -250,7 +322,7 @@ export class FeatureEngineeringService {
    */
   featuresToArray(features: MatchFeatures): number[] {
     return [
-      // Form features
+      // ===== FORM FEATURES (6) =====
       this.formToNumber(features.homeLastFiveResults),
       this.formToNumber(features.awayLastFiveResults),
       features.homePointsPerGame,
@@ -258,47 +330,87 @@ export class FeatureEngineeringService {
       features.homeGoalsScoredPerGame,
       features.awayGoalsScoredPerGame,
 
-      // Strength features (inverted position - higher is better)
-      19 - features.homeLeaguePosition,
-      19 - features.awayLeaguePosition,
-      features.homeGoalDifference / 50, // Normalize
+      // ===== STRENGTH FEATURES (5) =====
+      features.homeLeaguePosition,
+      features.awayLeaguePosition,
+      features.homeGoalDifference / 50,
       features.awayGoalDifference / 50,
-      features.homeExpectedGoals / 3,
-      features.awayExpectedGoals / 3,
+      features.homeExpectedGoals,
+      features.awayExpectedGoals,
 
-      // H2H features
+      // ===== H2H FEATURES (3) =====
       this.formToNumber(features.h2hLast5),
-      features.homeH2HWins / 5,
-      features.h2hTotalGoalsAvg / 5,
+      features.homeH2HWins,
+      features.h2hTotalGoalsAvg,
 
-      // Context features
+      // ===== CONTEXT FEATURES (3) =====
       features.homeAdvantage,
       Math.min(features.daysSinceLastMatchHome / 14, 1),
       Math.min(features.daysSinceLastMatchAway / 14, 1),
 
-      // Injury features (inverted - more injuries = lower value)
-      1 - Math.min(features.homeInjuriesCount / 5, 1),
-      1 - Math.min(features.awayInjuriesCount / 5, 1),
+      // ===== INJURY FEATURES (4) =====
+      Math.min(features.homeInjuriesCount / 5, 1),
+      Math.min(features.awayInjuriesCount / 5, 1),
       1 - features.homeInjuryImpact,
       1 - features.awayInjuryImpact,
 
-      // Momentum features
+      // ===== MOMENTUM FEATURES (4) =====
       Math.min(features.homeWinStreak / 5, 1),
       Math.min(features.awayWinStreak / 5, 1),
       Math.min(features.homeUnbeatenStreak / 10, 1),
       Math.min(features.awayUnbeatenStreak / 10, 1),
 
-      // Managerial features (normalized)
+      // ===== MANAGERIAL FEATURES (2) =====
       Math.min(features.homeManagerTenure / 1000, 1),
       Math.min(features.awayManagerTenure / 1000, 1),
 
-      // Environmental features
+      // ===== ENVIRONMENTAL FEATURES (2) =====
       features.weatherImpact,
-      (features.temperature + 30) / 60, // Normalize -30 to 30
+      (features.temperature + 30) / 60,
 
-      // Market feature
+      // ===== MARKET FEATURE (1) =====
       features.marketHomeProb,
     ];
+  }
+
+  /**
+   * Validate extracted features and return quality score
+   */
+  validateFeatures(features: MatchFeatures): { isValid: boolean; qualityScore: number; issues: string[] } {
+    const issues: string[] = [];
+    let qualityScore = 1.0;
+
+    // Check form data
+    if (!features.homeLastFiveResults || features.homeLastFiveResults.length < 3) {
+      issues.push('Insufficient home form data');
+      qualityScore *= 0.85;
+    }
+    if (!features.awayLastFiveResults || features.awayLastFiveResults.length < 3) {
+      issues.push('Insufficient away form data');
+      qualityScore *= 0.85;
+    }
+
+    // Check H2H data
+    if (!features.h2hLast5 || features.h2hLast5.length === 0) {
+      issues.push('No head-to-head data available');
+      qualityScore *= 0.9;
+    }
+
+    // Check league position data
+    if (features.homeLeaguePosition === 10) {
+      issues.push('Home team league position not found');
+      qualityScore *= 0.95;
+    }
+    if (features.awayLeaguePosition === 10) {
+      issues.push('Away team league position not found');
+      qualityScore *= 0.95;
+    }
+
+    return {
+      isValid: qualityScore >= 0.5,
+      qualityScore,
+      issues,
+    };
   }
 
   /**
@@ -312,5 +424,257 @@ export class FeatureEngineeringService {
       else if (char === 'D') score += 0.5;
     }
     return score / form.length;
+  }
+
+  private async getRecentFinishedFixtures(teamId: string, before: Date, limit: number): Promise<Fixture[]> {
+    return this.fixtureRepository.createQueryBuilder('fixture')
+      .where('(fixture.homeTeamId = :teamId OR fixture.awayTeamId = :teamId)', { teamId })
+      .andWhere('fixture.status = :status', { status: FixtureStatus.FINISHED })
+      .andWhere('fixture.homeGoals IS NOT NULL')
+      .andWhere('fixture.awayGoals IS NOT NULL')
+      .andWhere('fixture.kickoff < :before', { before })
+      .orderBy('fixture.kickoff', 'DESC')
+      .take(limit)
+      .getMany();
+  }
+
+  private computeTeamStatsFromFixtures(teamId: string, fixtures: Fixture[], referenceKickoff: Date): {
+    lastFiveForm: string;
+    goalsForPerGame: number;
+    goalsAgainstPerGame: number;
+    pointsPerGame: number;
+    winStreak: number;
+    unbeatenStreak: number;
+    daysSinceLastMatch: number | null;
+  } {
+    if (fixtures.length === 0) {
+      return {
+        lastFiveForm: '',
+        goalsForPerGame: 0,
+        goalsAgainstPerGame: 0,
+        pointsPerGame: 0,
+        winStreak: 0,
+        unbeatenStreak: 0,
+        daysSinceLastMatch: null,
+      };
+    }
+
+    const results: Array<'W' | 'D' | 'L'> = [];
+    let goalsFor = 0;
+    let goalsAgainst = 0;
+    let points = 0;
+
+    for (const f of fixtures) {
+      const isHome = f.homeTeamId === teamId;
+      const gf = isHome ? (f.homeGoals ?? 0) : (f.awayGoals ?? 0);
+      const ga = isHome ? (f.awayGoals ?? 0) : (f.homeGoals ?? 0);
+      goalsFor += gf;
+      goalsAgainst += ga;
+
+      let r: 'W' | 'D' | 'L';
+      if (gf > ga) {
+        r = 'W';
+        points += 3;
+      } else if (gf === ga) {
+        r = 'D';
+        points += 1;
+      } else {
+        r = 'L';
+      }
+      results.push(r);
+    }
+
+    const mostRecentKickoff = fixtures[0].kickoff;
+    const daysSinceLastMatch = Math.max(
+      0,
+      Math.round((referenceKickoff.getTime() - mostRecentKickoff.getTime()) / (24 * 60 * 60 * 1000)),
+    );
+
+    // Streaks from most recent backwards
+    let winStreak = 0;
+    let unbeatenStreak = 0;
+    for (const r of results) {
+      if (r === 'W') winStreak++;
+      else break;
+    }
+    for (const r of results) {
+      if (r !== 'L') unbeatenStreak++;
+      else break;
+    }
+
+    const lastFive = results.slice(0, 5).reverse().join(''); // oldest -> newest
+
+    return {
+      lastFiveForm: lastFive,
+      goalsForPerGame: goalsFor / fixtures.length,
+      goalsAgainstPerGame: goalsAgainst / fixtures.length,
+      pointsPerGame: points / fixtures.length,
+      winStreak,
+      unbeatenStreak,
+      daysSinceLastMatch,
+    };
+  }
+
+  private async getHeadToHeadFromDb(homeTeamId: string, awayTeamId: string, before: Date, limit: number): Promise<{
+    lastFiveForm: string;
+    homeWinsLast5: number;
+    avgTotalGoalsLast5: number;
+  }> {
+    const fixtures = await this.fixtureRepository.createQueryBuilder('fixture')
+      .where('fixture.status = :status', { status: FixtureStatus.FINISHED })
+      .andWhere('fixture.homeGoals IS NOT NULL')
+      .andWhere('fixture.awayGoals IS NOT NULL')
+      .andWhere(
+        '((fixture.homeTeamId = :home AND fixture.awayTeamId = :away) OR (fixture.homeTeamId = :away AND fixture.awayTeamId = :home))',
+        { home: homeTeamId, away: awayTeamId },
+      )
+      .andWhere('fixture.kickoff < :before', { before })
+      .orderBy('fixture.kickoff', 'DESC')
+      .take(limit)
+      .getMany();
+
+    const lastFive = fixtures.slice(0, 5);
+    let homeWins = 0;
+    let totalGoals = 0;
+
+    const results: Array<'W' | 'D' | 'L'> = [];
+    for (const f of lastFive) {
+      const homeWasHome = f.homeTeamId === homeTeamId;
+      const homeGoals = homeWasHome ? (f.homeGoals ?? 0) : (f.awayGoals ?? 0);
+      const awayGoals = homeWasHome ? (f.awayGoals ?? 0) : (f.homeGoals ?? 0);
+
+      totalGoals += homeGoals + awayGoals;
+
+      if (homeGoals > awayGoals) {
+        results.push('W');
+        homeWins++;
+      } else if (homeGoals === awayGoals) {
+        results.push('D');
+      } else {
+        results.push('L');
+      }
+    }
+
+    return {
+      lastFiveForm: results.reverse().join(''),
+      homeWinsLast5: homeWins,
+      avgTotalGoalsLast5: lastFive.length > 0 ? totalGoals / lastFive.length : 2.5,
+    };
+  }
+
+  private async getLeagueTableCached(leagueId: string, seasonStart: Date, before: Date): Promise<{
+    tableByTeamId: Map<string, LeagueTableEntry>;
+  }> {
+    const seasonYear = seasonStart.getUTCFullYear();
+    const asOf = before.toISOString().slice(0, 10);
+    const cacheKey = `${leagueId}:${seasonYear}:${asOf}`;
+
+    const cached = this.leagueTableCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached;
+    }
+
+    const fixtures = await this.fixtureRepository.createQueryBuilder('fixture')
+      .where('fixture.leagueId = :leagueId', { leagueId })
+      .andWhere('fixture.status = :status', { status: FixtureStatus.FINISHED })
+      .andWhere('fixture.homeGoals IS NOT NULL')
+      .andWhere('fixture.awayGoals IS NOT NULL')
+      .andWhere('fixture.kickoff >= :seasonStart', { seasonStart })
+      .andWhere('fixture.kickoff < :before', { before })
+      .getMany();
+
+    const stats = new Map<string, { points: number; played: number; gf: number; ga: number }>();
+    const ensure = (teamId: string) => {
+      if (!stats.has(teamId)) stats.set(teamId, { points: 0, played: 0, gf: 0, ga: 0 });
+      return stats.get(teamId)!;
+    };
+
+    for (const f of fixtures) {
+      const hg = f.homeGoals ?? 0;
+      const ag = f.awayGoals ?? 0;
+
+      const home = ensure(f.homeTeamId);
+      const away = ensure(f.awayTeamId);
+
+      home.played += 1;
+      away.played += 1;
+      home.gf += hg;
+      home.ga += ag;
+      away.gf += ag;
+      away.ga += hg;
+
+      if (hg > ag) home.points += 3;
+      else if (hg < ag) away.points += 3;
+      else {
+        home.points += 1;
+        away.points += 1;
+      }
+    }
+
+    const rows = Array.from(stats.entries()).map(([teamId, s]) => ({
+      teamId,
+      points: s.points,
+      played: s.played,
+      gd: s.gf - s.ga,
+      gf: s.gf,
+      ga: s.ga,
+    }));
+
+    rows.sort((a, b) => {
+      if (b.points !== a.points) return b.points - a.points;
+      if (b.gd !== a.gd) return b.gd - a.gd;
+      return b.gf - a.gf;
+    });
+
+    const tableByTeamId = new Map<string, LeagueTableEntry>();
+    rows.forEach((r, idx) => {
+      tableByTeamId.set(r.teamId, {
+        position: idx + 1,
+        played: r.played,
+        pointsPerGame: r.played > 0 ? r.points / r.played : 0,
+        goalsForPerGame: r.played > 0 ? r.gf / r.played : 0,
+        goalsAgainstPerGame: r.played > 0 ? r.ga / r.played : 0,
+        goalDifference: r.gd,
+      });
+    });
+
+    const value: LeagueTableCacheEntry = { expiresAt: Date.now() + this.leagueTableTtlMs, tableByTeamId };
+    this.leagueTableCache.set(cacheKey, value);
+
+    return value;
+  }
+
+  private async getStandingsCached(leagueId: string): Promise<Map<string, Standing>> {
+    const cacheKey = `${leagueId}`;
+    const cached = this.standingsCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.map;
+    }
+
+    const rows = await this.standingRepository.find({ where: { leagueId } });
+    const map = new Map<string, Standing>();
+    rows.forEach(r => map.set(r.teamId, r));
+
+    this.standingsCache.set(cacheKey, { expiresAt: Date.now() + this.leagueTableTtlMs, map });
+    return map;
+  }
+
+  private getSeasonStartDate(kickoff: Date): Date {
+    const year = kickoff.getUTCFullYear();
+    const month = kickoff.getUTCMonth(); // 0=Jan
+    const seasonStartYear = month >= 6 ? year : year - 1; // July 1st
+    return new Date(Date.UTC(seasonStartYear, 6, 1, 0, 0, 0));
+  }
+
+  private formStringToStats(form: string): { gamesPlayed: number; wins: number; draws: number; losses: number } {
+    const results = (form || '').split('') as Array<'W' | 'D' | 'L'>;
+    const wins = results.filter(r => r === 'W').length;
+    const draws = results.filter(r => r === 'D').length;
+    const losses = results.filter(r => r === 'L').length;
+    return { gamesPlayed: results.length, wins, draws, losses };
+  }
+
+  private clampNumber(v: number, min: number, max: number): number {
+    return Math.max(min, Math.min(max, v));
   }
 }

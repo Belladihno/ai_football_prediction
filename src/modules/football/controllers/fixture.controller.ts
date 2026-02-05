@@ -7,6 +7,7 @@ import {
   Body,
   Logger,
 } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiResponse, ApiQuery } from '@nestjs/swagger';
 import { FixtureService } from '../services/fixture.service';
 import { Fixture, FixtureStatus } from '../entities/fixture.entity';
 
@@ -18,6 +19,7 @@ interface FixtureQueryDto {
   limit?: number;
 }
 
+@ApiTags('Fixtures')
 @Controller('fixtures')
 export class FixtureController {
   private readonly logger = new Logger(FixtureController.name);
@@ -26,6 +28,13 @@ export class FixtureController {
 
   // Get all fixtures with filters
   @Get()
+  @ApiOperation({ summary: 'Get all fixtures', description: 'Returns fixtures with optional filters' })
+  @ApiQuery({ name: 'leagueId', required: false })
+  @ApiQuery({ name: 'fromDate', required: false })
+  @ApiQuery({ name: 'toDate', required: false })
+  @ApiQuery({ name: 'status', required: false, enum: FixtureStatus })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  @ApiResponse({ status: 200, description: 'List of fixtures' })
   async findAll(@Query() query: FixtureQueryDto): Promise<Fixture[]> {
     this.logger.log(`Getting fixtures with query: ${JSON.stringify(query)}`);
 
@@ -41,12 +50,17 @@ export class FixtureController {
 
   // Get today's fixtures
   @Get('today')
+  @ApiOperation({ summary: 'Get today fixtures', description: 'Returns all fixtures scheduled for today' })
+  @ApiResponse({ status: 200, description: 'List of today fixtures' })
   async getToday(): Promise<Fixture[]> {
     return this.fixtureService.getTodayFixtures();
   }
 
   // Get upcoming fixtures (next 7 days by default)
   @Get('upcoming')
+  @ApiOperation({ summary: 'Get upcoming fixtures', description: 'Returns fixtures scheduled for the next N days' })
+  @ApiQuery({ name: 'days', required: false, description: 'Number of days to look ahead' })
+  @ApiResponse({ status: 200, description: 'List of upcoming fixtures' })
   async getUpcoming(@Query('days') days?: string): Promise<Fixture[]> {
     const daysCount = days ? parseInt(days, 10) : 7;
     return this.fixtureService.getUpcomingFixtures(daysCount);
@@ -54,6 +68,8 @@ export class FixtureController {
 
   // Get single fixture by ID
   @Get(':id')
+  @ApiOperation({ summary: 'Get fixture by ID', description: 'Returns detailed information for a specific fixture' })
+  @ApiResponse({ status: 200, description: 'Fixture details' })
   async findOne(@Param('id') id: string): Promise<Fixture> {
     return this.fixtureService.findOne(id);
   }

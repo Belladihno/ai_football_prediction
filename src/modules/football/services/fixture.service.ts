@@ -1,10 +1,10 @@
 import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, Between, LessThanOrEqual, MoreThanOrEqual } from 'typeorm';
+import { Repository } from 'typeorm';
 import { Fixture, FixtureStatus } from '../entities/fixture.entity';
-import { FootballDataApiService } from './football-data-api.service';
+import { FootballDataOrgService, FdOMatch } from './football-data-org.service';
+import { TeamService } from './team.service';
 import { League } from '../entities/league.entity';
-import { Team } from '../entities/team.entity';
 
 @Injectable()
 export class FixtureService {
@@ -13,7 +13,8 @@ export class FixtureService {
   constructor(
     @InjectRepository(Fixture)
     private fixtureRepository: Repository<Fixture>,
-    private footballApi: FootballDataApiService,
+    private footballData: FootballDataOrgService,
+    private teamService: TeamService,
   ) {}
 
   async findAll(options?: {
@@ -87,26 +88,41 @@ export class FixtureService {
     const future = new Date();
     future.setDate(now.getDate() + days);
 
-    return this.findAll({ fromDate: now, toDate: future, status: FixtureStatus.SCHEDULED });
+    const statuses: FixtureStatus[] = [FixtureStatus.SCHEDULED, FixtureStatus.TIMED];
+
+    return this.fixtureRepository.createQueryBuilder('fixture')
+      .leftJoinAndSelect('fixture.homeTeam', 'homeTeam')
+      .leftJoinAndSelect('fixture.awayTeam', 'awayTeam')
+      .leftJoinAndSelect('fixture.league', 'league')
+      .where('fixture.kickoff >= :fromDate', { fromDate: now })
+      .andWhere('fixture.kickoff <= :toDate', { toDate: future })
+      .andWhere('fixture.status IN (:...statuses)', { statuses })
+      .orderBy('fixture.kickoff', 'ASC')
+      .getMany();
   }
 
   async syncFixtures(leagueCode: string, leagueId: string): Promise<{ created: number; updated: number }> {
     this.logger.log(`Syncing fixtures for league ${leagueCode}`);
 
-    const apiFixtures = await this.footballApi.getUpcomingMatches(leagueCode);
+    // Get all matches for the competition
+    const apiMatches = await this.footballData.getMatches(leagueCode);
+    
+    // Filter for scheduled/timed matches (upcoming)
+    const upcomingMatches = apiMatches.filter(m => 
+      m.status === 'SCHEDULED' || m.status === 'TIMED'
+    );
+
     let created = 0;
     let updated = 0;
 
-    for (const apiFixture of apiFixtures) {
-      const existingFixture = await this.findByExternalId(apiFixture.id);
+    for (const apiMatch of upcomingMatches) {
+      const existingFixture = await this.findByExternalId(apiMatch.id);
 
       if (existingFixture) {
-        // Update existing fixture
-        await this.updateFromApi(existingFixture, apiFixture, leagueId);
+        await this.updateFromApi(existingFixture, apiMatch, leagueId);
         updated++;
       } else {
-        // Create new fixture
-        await this.createFromApi(apiFixture, leagueId);
+        await this.createFromApi(apiMatch, leagueId);
         created++;
       }
     }
@@ -115,23 +131,53 @@ export class FixtureService {
     return { created, updated };
   }
 
-  // Create fixture from API data
-  private async createFromApi(apiFixture: any, leagueId: string): Promise<Fixture> {
+  async syncAllFixtures(leagueCode: string, leagueId: string): Promise<{ created: number; updated: number }> {
+    this.logger.log(`Syncing ALL fixtures for league ${leagueCode}`);
+
+    // Get all matches for the competition
+    const apiMatches = await this.footballData.getMatches(leagueCode);
+
+    let created = 0;
+    let updated = 0;
+
+    for (const apiMatch of apiMatches) {
+      const existingFixture = await this.findByExternalId(apiMatch.id);
+
+      if (existingFixture) {
+        await this.updateFromApi(existingFixture, apiMatch, leagueId);
+        updated++;
+      } else {
+        await this.createFromApi(apiMatch, leagueId);
+        created++;
+      }
+    }
+
+    this.logger.log(`Sync complete: ${created} created, ${updated} updated`);
+    return { created, updated };
+  }
+
+  private async createFromApi(apiMatch: FdOMatch, leagueId: string): Promise<Fixture> {
     // Find or create teams
-    const homeTeam = await this.findOrCreateTeam(apiFixture.homeTeam.id, apiFixture.homeTeam.name);
-    const awayTeam = await this.findOrCreateTeam(apiFixture.awayTeam.id, apiFixture.awayTeam.name);
+    const homeTeam = await this.teamService.findOrCreateTeam(
+      apiMatch.homeTeam.id,
+      apiMatch.homeTeam.name,
+    );
+    const awayTeam = await this.teamService.findOrCreateTeam(
+      apiMatch.awayTeam.id,
+      apiMatch.awayTeam.name,
+    );
 
     const fixture = this.fixtureRepository.create({
-      externalId: apiFixture.id,
-      kickoff: new Date(apiFixture.utcDate),
-      matchday: apiFixture.matchday,
-      status: this.mapStatus(apiFixture.status),
-      homeGoals: apiFixture.score.fullTime.home,
-      awayGoals: apiFixture.score.fullTime.away,
-      homeHalfTimeGoals: apiFixture.score.halfTime.home,
-      awayHalfTimeGoals: apiFixture.score.halfTime.away,
-      venue: apiFixture.venue,
-      referee: apiFixture.referee,
+      externalId: apiMatch.id,
+      kickoff: new Date(apiMatch.utcDate),
+      matchday: apiMatch.matchday || null,
+      status: this.mapStatus(apiMatch.status),
+      homeGoals: apiMatch.score.fullTime.home,
+      awayGoals: apiMatch.score.fullTime.away,
+      homeHalfTimeGoals: apiMatch.score.halfTime.home,
+      awayHalfTimeGoals: apiMatch.score.halfTime.away,
+      venue: null, // football-data.org doesn't include venue in match response
+      referee: null,
       homeTeamId: homeTeam.id,
       awayTeamId: awayTeam.id,
       leagueId,
@@ -140,42 +186,30 @@ export class FixtureService {
     return this.fixtureRepository.save(fixture);
   }
 
-  // Update fixture from API data
-  private async updateFromApi(fixture: Fixture, apiFixture: any, leagueId: string): Promise<Fixture> {
-    fixture.kickoff = new Date(apiFixture.utcDate);
-    fixture.matchday = apiFixture.matchday;
-    fixture.status = this.mapStatus(apiFixture.status);
-    fixture.homeGoals = apiFixture.score.fullTime.home;
-    fixture.awayGoals = apiFixture.score.fullTime.away;
-    fixture.homeHalfTimeGoals = apiFixture.score.halfTime.home;
-    fixture.awayHalfTimeGoals = apiFixture.score.halfTime.away;
-    fixture.venue = apiFixture.venue;
-    fixture.referee = apiFixture.referee;
+  private updateFromApi(fixture: Fixture, apiMatch: FdOMatch, leagueId: string): Promise<Fixture> {
+    fixture.kickoff = new Date(apiMatch.utcDate);
+    fixture.matchday = apiMatch.matchday || null;
+    fixture.status = this.mapStatus(apiMatch.status);
+    fixture.homeGoals = apiMatch.score.fullTime.home;
+    fixture.awayGoals = apiMatch.score.fullTime.away;
+    fixture.homeHalfTimeGoals = apiMatch.score.halfTime.home;
+    fixture.awayHalfTimeGoals = apiMatch.score.halfTime.away;
 
     return this.fixtureRepository.save(fixture);
   }
 
-  // Map API status to our status enum
-  private mapStatus(apiStatus: string): FixtureStatus {
+  private mapStatus(status: string): FixtureStatus {
     const statusMap: Record<string, FixtureStatus> = {
-      SCHEDULED: FixtureStatus.SCHEDULED,
-      TIMED: FixtureStatus.TIMED,
-      IN_PLAY: FixtureStatus.IN_PLAY,
-      PAUSED: FixtureStatus.PAUSED,
-      FINISHED: FixtureStatus.FINISHED,
-      POSTPONED: FixtureStatus.POSTPONED,
-      SUSPENDED: FixtureStatus.SUSPENDED,
-      CANCELLED: FixtureStatus.CANCELLED,
+      'SCHEDULED': FixtureStatus.SCHEDULED,
+      'TIMED': FixtureStatus.TIMED,
+      'IN_PLAY': FixtureStatus.IN_PLAY,
+      'PAUSED': FixtureStatus.PAUSED,
+      'FINISHED': FixtureStatus.FINISHED,
+      'POSTPONED': FixtureStatus.POSTPONED,
+      'SUSPENDED': FixtureStatus.SUSPENDED,
+      'CANCELLED': FixtureStatus.CANCELLED,
     };
 
-    return statusMap[apiStatus] || FixtureStatus.SCHEDULED;
-  }
-
-  // Find or create team by external ID
-  private async findOrCreateTeam(externalId: number, name: string): Promise<Team> {
-    // This will be implemented in TeamService
-    // For now, return a placeholder
-    this.logger.warn(`Team ${name} (${externalId}) needs to be created first`);
-    return { id: externalId.toString() } as Team;
+    return statusMap[status] || FixtureStatus.SCHEDULED;
   }
 }

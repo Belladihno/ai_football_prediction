@@ -5,16 +5,17 @@ This script exports trained models to ONNX format for use
 with ONNX Runtime in Node.js.
 
 Supports:
-- XGBoost
-- Random Forest
-- Logistic Regression
-- Scikit-learn models
+- XGBoost (via JSON format and custom loader)
+- Random Forest (ONNX)
+- Logistic Regression (ONNX)
+- Scikit-learn models (ONNX)
 """
 
 import numpy as np
 import json
 import pandas as pd
 import onnx
+from onnx import helper, TensorProto, GraphProto
 from onnxconverter_common import FloatTensorType
 from skl2onnx import convert_sklearn
 from skl2onnx.common.data_types import FloatTensorType
@@ -28,7 +29,7 @@ class ONNXExporter:
     Export trained models to ONNX format.
     """
 
-    def __init__(self, input_dim: int = 30):
+    def __init__(self, input_dim: int = 31):
         """
         Initialize exporter.
 
@@ -45,41 +46,47 @@ class ONNXExporter:
         output_path: str
     ) -> None:
         """
-        Export XGBoost model to ONNX.
+        Export XGBoost model to ONNX-compatible format.
+
+        Since skl2onnx doesn't support XGBClassifier directly, we:
+        1. Save the model in XGBoost's native JSON format
+        2. Create metadata for custom Node.js loader
 
         Args:
-            model: Trained XGBoost_name: Name for the model
-            model
-            model output_path: Path to save ONNX file
+            model: Trained XGBoost model
+            model_name: Name for the model
+            output_path: Path to save model file
         """
-        # Convert to ONNX using skl2onnx
-        # XGBoost requires special handling
-
         try:
-            onnx_model = convert_sklearn(
-                model,
-                initial_types=self.initial_type,
-                target_opset=12,
-            )
+            booster = model.get_booster()
 
-            # Save model
-            onnx.save(onnx_model, output_path)
+            # Save XGBoost model in native JSON format
+            json_path = output_path.replace('.onnx', '_xgboost.json')
+            booster.save_model(json_path)
 
-            # Save metadata
+            # Create metadata
             metadata = {
                 'model_name': model_name,
                 'model_type': 'xgboost',
                 'input_dim': self.input_dim,
                 'num_classes': 3,
-                'n_estimators': model.n_estimators,
-                'max_depth': model.max_depth,
+                'n_estimators': int(model.n_estimators),
+                'max_depth': int(model.max_depth),
+                'learning_rate': float(model.learning_rate),
+                'json_path': json_path,
+                'classes': ['HOME', 'DRAW', 'AWAY'],
+                'note': 'XGBoost uses native JSON format. Use custom Node.js loader.'
             }
 
             metadata_path = output_path.replace('.onnx', '_metadata.json')
             with open(metadata_path, 'w') as f:
                 json.dump(metadata, f, indent=2)
 
-            print(f"[OK] Exported XGBoost model to {output_path}")
+            # Copy the JSON file to the ONNX path for consistency
+            import shutil
+            shutil.copy(json_path, output_path.replace('.onnx', '.json'))
+
+            print(f"[OK] Exported XGBoost model to {json_path}")
             print(f"  Metadata saved to {metadata_path}")
 
         except Exception as e:
@@ -101,24 +108,49 @@ class ONNXExporter:
             model_name: Name for the model
             output_path: Path to save JSON file
         """
-        # Extract model parameters
-        model_data = {
-            'model_name': model_name,
-            'model_type': 'xgboost_json',
-            'input_dim': self.input_dim,
-            'num_classes': 3,
-            'n_estimators': int(model.n_estimators),
-            'max_depth': int(model.max_depth),
-            'learning_rate': float(model.learning_rate),
-            'tree_structure': model.get_booster().dump_model() if model.get_booster() else None,
-        }
+        try:
+            booster = model.get_booster()
 
-        # Save as JSON
-        with open(output_path, 'w') as f:
-            json.dump(model_data, f, indent=2)
+            # Extract model structure
+            trees = booster.get_dump(dump_format='json')
 
-        print(f"[OK] Saved XGBoost parameters to {output_path}")
-        print("  (Note: This is a JSON fallback. Install onnx for proper ONNX export)")
+            model_data = {
+                'model_name': model_name,
+                'model_type': 'xgboost_json',
+                'input_dim': self.input_dim,
+                'num_classes': 3,
+                'n_estimators': int(model.n_estimators),
+                'max_depth': int(model.max_depth),
+                'learning_rate': float(model.learning_rate),
+                'trees': trees,
+            }
+
+            # Save as JSON
+            json_path = output_path.replace('.onnx', '.json')
+            with open(json_path, 'w') as f:
+                json.dump(model_data, f, indent=2)
+
+            # Save metadata
+            metadata = {
+                'model_name': model_name,
+                'model_type': 'xgboost',
+                'input_dim': self.input_dim,
+                'num_classes': 3,
+                'n_estimators': int(model.n_estimators),
+                'max_depth': int(model.max_depth),
+                'learning_rate': float(model.learning_rate),
+                'json_path': json_path,
+            }
+
+            metadata_path = output_path.replace('.onnx', '_metadata.json')
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+
+            print(f"[OK] Saved XGBoost parameters to {json_path}")
+            print(f"  Metadata saved to {metadata_path}")
+
+        except Exception as e:
+            print(f"[ERROR] Fallback also failed: {e}")
 
     def export_random_forest(
         self,
@@ -280,6 +312,6 @@ if __name__ == '__main__':
     print("\n" + "="*50)
     print("To use in Node.js:")
     print("  npm install onnxruntime")
-    print("\nExample usage:")
-    print("  const session = await onnxruntime.InferenceSession('xgboost_v1.onnx');")
-    print("  const results = await session.run(['output'], { 'float_input': inputData });")
+    print("\nXGBoost Note:")
+    print("  XGBoost models use JSON format. See model_comparison_report.md")
+    print("  for the custom Node.js loader implementation.")

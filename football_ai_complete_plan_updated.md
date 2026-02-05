@@ -24,80 +24,721 @@
 
 ## Target Leagues
 
-| League | Country | API Code |
-|--------|---------|----------|
-| Premier League | England | `PL` |
-| La Liga | Spain | `PD` |
-| Bundesliga | Germany | `BL1` |
-| Serie A | Italy | `SA` |
-| Ligue 1 | France | `FL1` |
+| League | Country | football-data.org Code | Season |
+|--------|---------|------------------------|--------|
+| Premier League | England | `PL` | Current |
+| La Liga | Spain | `PD` | Current |
+| Bundesliga | Germany | `BL1` | Current |
+| Serie A | Italy | `SA` | Current |
+| Ligue 1 | France | `FL1` | Current |
+
+> **Note**: football-data.org is the primary data source for fixtures, teams, standings, and matches (10 req/min free tier).
 
 ---
 
 ## Free API Strategy
 
 > [!IMPORTANT]
-> Since we're using free tiers, we'll combine multiple APIs to maximize data coverage and stay within rate limits.
+> We stay within free tiers by using football-data.org as the core feed and supplementing only where it has gaps.
 
 ### Multi-API Architecture
 
 ```mermaid
 graph LR
-    subgraph "Primary Data"
-        FD[Football-Data.org]
+    subgraph "Primary Data Source"
+        FDO[football-data.org v4]
     end
     
-    subgraph "Secondary Data"
-        API_F[API-Football Free]
-        OPEN[OpenLigaDB]
-    end
-    
-    subgraph "Supplementary"
+    subgraph "Supplementary Data"
         FPL[Fantasy PL API]
-        SCRAPE[Web Scraping]
-        WEATHER[OpenWeatherMap]
-        ODDS[OddsAPI Free]
+        MANUAL[Manual Injuries (non-PL)]
+        WEATHER[Open-Meteo]
+        STATS[StatsBomb Open Data]
     end
     
     subgraph "NestJS Backend"
-        AGG[Data Aggregator Service]
+        SYNC[Sync + DB]
+        FE[Feature Engineering]
     end
     
-    FD -->|Fixtures, Standings| AGG
-    API_F -->|H2H, Predictions| AGG
-    OPEN -->|Live Scores| AGG
-    FPL -->|Injuries PL| AGG
-    SCRAPE -->|News, Injuries| AGG
-    WEATHER -->|Match Conditions| AGG
-    ODDS -->|Market Baseline| AGG
+    FDO -->|Fixtures, Teams, Standings, Matches| SYNC
+    FPL -->|PL Injuries| SYNC
+    MANUAL -->|Non-PL Injuries| SYNC
+    WEATHER -->|Match Conditions| FE
+    STATS -->|Historical xG (training)| FE
+    SYNC --> FE
 ```
+
+**Why football-data.org as Primary?**
+- Free and stable REST API
+- Current-season coverage for top European leagues
+- Straightforward endpoints for fixtures, teams, matches, standings
+- Works well with rate-limited sync + caching
 
 ### API Comparison & Strategy
 
 | API | Free Limits | Data We'll Use | Priority |
 |-----|-------------|----------------|----------|
-| **Football-Data.org** | 10 req/min | Fixtures, Standings, Teams, Matches | Primary |
-| **API-Football** | 100 req/day | H2H data, Team statistics | Secondary |
-| **OpenLigaDB** | Unlimited | Live scores (Bundesliga focus) | Backup |
-| **Fantasy PL API** | Unlimited | PL injuries, player stats | Supplementary |
-| **OpenWeatherMap** | 1000 req/day | Weather conditions | Supplementary |
-| **OddsAPI** | 500 req/month | Market odds baseline | Supplementary |
+| **football-data.org** | 10 req/min | Fixtures, Teams, Standings, Matches | **Primary** |
+| **Fantasy PL API** | Unlimited | PL injuries | Supplementary |
+| **Open-Meteo** | Unlimited | Weather conditions | Supplementary |
+| **StatsBomb Open Data** | Unlimited (GitHub) | Historical xG for training | Training Only |
+| **Manual Entry** | N/A | Non-PL injuries | As needed |
 
 ### Rate Limit Management
 
 ```typescript
 // Smart request pooling across APIs
 const API_LIMITS = {
-  'football-data.org': { perMinute: 10, daily: Infinity },
-  'api-football': { perMinute: 10, daily: 100 },
-  'openligadb': { perMinute: Infinity, daily: Infinity },
-  'openweathermap': { perMinute: 60, daily: 1000 },
-  'odds-api': { perMinute: 10, daily: 17 },
+  'football-data-org': { perMinute: 10 },
+  'fantasy-pl': { perMinute: Infinity },
+  'open-meteo': { perMinute: Infinity },
+};
+
+// Sync pacing for football-data.org free tier
+const SYNC_DELAYS_MS = {
+  between_calls: 6000, // 10 req/min
 };
 ```
 
 ---
 
+## Football-Data.org Integration Guide
+
+### Getting Started with football-data.org
+
+1. Create a free account and API key at football-data.org
+2. Store the key in `.env`
+
+```bash
+# .env
+FOOTBALL_DATA_API_KEY=your_api_key_here
+FOOTBALL_DATA_BASE_URL=https://api.football-data.org/v4
+```
+
+### API Base Configuration
+
+```typescript
+// src/config/configuration.ts
+footballDataOrg: {
+  baseUrl: process.env.FOOTBALL_DATA_BASE_URL || 'https://api.football-data.org/v4',
+  apiKey: process.env.FOOTBALL_DATA_API_KEY || '',
+},
+```
+
+### Core Endpoints (free tier)
+
+- `GET /competitions/{code}/matches`
+- `GET /competitions/{code}/teams`
+- `GET /competitions/{code}/standings`
+- `GET /teams/{id}/matches`
+
+### Notes
+
+- Free tier limit: **10 requests/minute** (use 6s delays + caching)
+- No odds or injuries in free tier â€” PL injuries come from FPL API
+
+<!--
+### Deprecated API Integration (removed)
+
+#### 1. Sign Up & Get API Key
+
+1. Visit the provider website (deprecated)
+2. Click "Register" (No credit card required)
+3. Verify your email
+4. Get your API key from the dashboard
+5. Store it securely in `.env`
+
+```bash
+# .env
+DEPRECATED_API_KEY=your_api_key_here
+DEPRECATED_API_HOST=deprecated.host
+```
+
+#### 2. API Base Configuration
+
+```typescript
+// src/config/apis.config.ts
+export const apiFootballConfig = {
+  baseURL: 'https://v3.football.api-sports.io',
+  headers: {
+    'x-rapidapi-key': process.env.DEPRECATED_API_KEY,
+    'x-rapidapi-host': process.env.DEPRECATED_API_HOST,
+  },
+  timeout: 10000,
+  limits: {
+    requestsPerMinute: 10,
+    requestsPerDay: 100,
+  },
+};
+```
+
+### Core Endpoints Reference
+
+#### Fixtures Endpoint
+
+**Get Fixtures by League and Season**
+```typescript
+// GET /fixtures?league=39&season=2024
+const getFixtures = async (leagueId: number, season: number) => {
+  const response = await axios.get(`${baseURL}/fixtures`, {
+    params: { league: leagueId, season },
+    headers: apiHeaders,
+  });
+  return response.data;
+};
+
+// Response structure
+{
+  "response": [
+    {
+      "fixture": {
+        "id": 1035046,
+        "referee": "Michael Oliver",
+        "timezone": "UTC",
+        "date": "2024-02-04T15:00:00+00:00",
+        "timestamp": 1707055200,
+        "venue": {
+          "id": 494,
+          "name": "Etihad Stadium",
+          "city": "Manchester"
+        },
+        "status": {
+          "long": "Not Started",
+          "short": "NS",
+          "elapsed": null
+        }
+      },
+      "league": {
+        "id": 39,
+        "name": "Premier League",
+        "country": "England",
+        "season": 2024,
+        "round": "Regular Season - 24"
+      },
+      "teams": {
+        "home": {
+          "id": 50,
+          "name": "Manchester City",
+          "logo": "https://...",
+          "winner": null
+        },
+        "away": {
+          "id": 33,
+          "name": "Manchester United",
+          "logo": "https://...",
+          "winner": null
+        }
+      },
+      "goals": {
+        "home": null,
+        "away": null
+      },
+      "score": {
+        "halftime": { "home": null, "away": null },
+        "fulltime": { "home": null, "away": null }
+      }
+    }
+  ]
+}
+```
+
+**Get Live Fixtures**
+```typescript
+// GET /fixtures?live=all (or specific league)
+const getLiveFixtures = async () => {
+  const response = await axios.get(`${baseURL}/fixtures`, {
+    params: { live: 'all' },
+    headers: apiHeaders,
+  });
+  return response.data.response;
+};
+```
+
+**Get Fixtures by Date Range**
+```typescript
+// GET /fixtures?from=2024-02-01&to=2024-02-07
+const getFixturesByDateRange = async (from: string, to: string) => {
+  const response = await axios.get(`${baseURL}/fixtures`, {
+    params: { from, to },
+    headers: apiHeaders,
+  });
+  return response.data.response;
+};
+```
+
+#### Standings Endpoint
+
+```typescript
+// GET /standings?league=39&season=2024
+const getStandings = async (leagueId: number, season: number) => {
+  const response = await axios.get(`${baseURL}/standings`, {
+    params: { league: leagueId, season },
+    headers: apiHeaders,
+  });
+  return response.data;
+};
+
+// Response structure
+{
+  "response": [
+    {
+      "league": {
+        "id": 39,
+        "name": "Premier League",
+        "season": 2024,
+        "standings": [[
+          {
+            "rank": 1,
+            "team": {
+              "id": 50,
+              "name": "Manchester City",
+              "logo": "https://..."
+            },
+            "points": 56,
+            "goalsDiff": 35,
+            "group": "Premier League",
+            "form": "WWWDW",
+            "status": "same",
+            "description": "Promotion - Champions League",
+            "all": {
+              "played": 24,
+              "win": 17,
+              "draw": 5,
+              "lose": 2,
+              "goals": { "for": 60, "against": 25 }
+            },
+            "home": {
+              "played": 12,
+              "win": 9,
+              "draw": 2,
+              "lose": 1,
+              "goals": { "for": 32, "against": 12 }
+            },
+            "away": {
+              "played": 12,
+              "win": 8,
+              "draw": 3,
+              "lose": 1,
+              "goals": { "for": 28, "against": 13 }
+            }
+          }
+        ]]
+      }
+    }
+  ]
+}
+```
+
+#### Head-to-Head Endpoint
+
+```typescript
+// GET /fixtures/headtohead?h2h=33-34
+const getH2H = async (team1Id: number, team2Id: number) => {
+  const response = await axios.get(`${baseURL}/fixtures/headtohead`, {
+    params: { h2h: `${team1Id}-${team2Id}` },
+    headers: apiHeaders,
+  });
+  return response.data.response;
+};
+```
+
+#### Team Statistics Endpoint
+
+```typescript
+// GET /teams/statistics?league=39&season=2024&team=50
+const getTeamStatistics = async (
+  leagueId: number, 
+  season: number, 
+  teamId: number
+) => {
+  const response = await axios.get(`${baseURL}/teams/statistics`, {
+    params: { league: leagueId, season, team: teamId },
+    headers: apiHeaders,
+  });
+  return response.data;
+};
+
+// Response includes:
+{
+  "form": "WWDLW",
+  "fixtures": {
+    "played": { "home": 12, "away": 12, "total": 24 },
+    "wins": { "home": 9, "away": 8, "total": 17 },
+    "draws": { "home": 2, "away": 3, "total": 5 },
+    "loses": { "home": 1, "away": 1, "total": 2 }
+  },
+  "goals": {
+    "for": {
+      "total": { "home": 32, "away": 28, "total": 60 },
+      "average": { "home": "2.7", "away": "2.3", "total": "2.5" }
+    },
+    "against": {
+      "total": { "home": 12, "away": 13, "total": 25 },
+      "average": { "home": "1.0", "away": "1.1", "total": "1.0" }
+    }
+  },
+  "clean_sheet": { "home": 7, "away": 6, "total": 13 },
+  "failed_to_score": { "home": 1, "away": 2, "total": 3 }
+}
+```
+
+#### Injuries/Sidelined Endpoint
+
+```typescript
+// GET /injuries?league=39&season=2024&team=50
+const getInjuries = async (
+  leagueId: number,
+  season: number,
+  teamId?: number
+) => {
+  const response = await axios.get(`${baseURL}/injuries`, {
+    params: { league: leagueId, season, team: teamId },
+    headers: apiHeaders,
+  });
+  return response.data.response;
+};
+
+// Response structure
+{
+  "response": [
+    {
+      "player": {
+        "id": 306,
+        "name": "K. De Bruyne",
+        "photo": "https://..."
+      },
+      "team": {
+        "id": 50,
+        "name": "Manchester City",
+        "logo": "https://..."
+      },
+      "fixture": {
+        "id": 1035046,
+        "date": "2024-02-04T15:00:00+00:00"
+      },
+      "league": {
+        "id": 39,
+        "name": "Premier League",
+        "season": 2024
+      },
+      "type": "Missing Fixture",
+      "reason": "Injury"
+    }
+  ]
+}
+```
+
+#### Predictions Endpoint (Bonus!)
+
+```typescript
+// GET /predictions?fixture=1035046
+const getPrediction = async (fixtureId: number) => {
+  const response = await axios.get(`${baseURL}/predictions`, {
+    params: { fixture: fixtureId },
+    headers: apiHeaders,
+  });
+  return response.data.response;
+};
+
+// Returns AI prediction from deprecated provider (removed)
+{
+  "predictions": {
+    "winner": {
+      "id": 50,
+      "name": "Manchester City",
+      "comment": "Win or draw"
+    },
+    "win_or_draw": true,
+    "under_over": "Over 2.5",
+    "goals": {
+      "home": "2.0",
+      "away": "1.0"
+    },
+    "advice": "Combo Double chance : Home/Draw + Over 2.5"
+  },
+  "comparison": {
+    "form": { "home": "83%", "away": "67%" },
+    "att": { "home": "95%", "away": "78%" },
+    "def": { "home": "92%", "away": "65%" }
+  }
+}
+```
+
+#### Odds Endpoint
+
+```typescript
+// GET /odds?fixture=1035046&bookmaker=8
+const getOdds = async (fixtureId: number, bookmakerId: number = 8) => {
+  const response = await axios.get(`${baseURL}/odds`, {
+    params: { fixture: fixtureId, bookmaker: bookmakerId },
+    headers: apiHeaders,
+  });
+  return response.data.response;
+};
+```
+
+### League ID Reference
+
+```typescript
+export const LEAGUE_IDS = {
+  PREMIER_LEAGUE: 39,
+  LA_LIGA: 140,
+  BUNDESLIGA: 78,
+  SERIE_A: 135,
+  LIGUE_1: 61,
+  CHAMPIONS_LEAGUE: 2,
+  EUROPA_LEAGUE: 3,
+  FA_CUP: 45,
+  COPA_DEL_REY: 143,
+  DFB_POKAL: 81,
+  COPPA_ITALIA: 137,
+  COUPE_DE_FRANCE: 66,
+};
+
+export const CURRENT_SEASON = 2024;
+```
+
+### NestJS Service Implementation
+
+```typescript
+// src/modules/football/services/deprecated-api.service.ts
+import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import axios, { AxiosInstance } from 'axios';
+import { ApiRateLimiterService } from '@/common/services/api-rate-limiter.service';
+
+@Injectable()
+export class ApiFootballService {
+  private readonly logger = new Logger(ApiFootballService.name);
+  private readonly axiosInstance: AxiosInstance;
+
+  constructor(
+    private configService: ConfigService,
+    private rateLimiter: ApiRateLimiterService,
+  ) {
+    this.axiosInstance = axios.create({
+      baseURL: 'https://v3.football.api-sports.io',
+      timeout: 10000,
+      headers: {
+        'x-rapidapi-key': this.configService.get('DEPRECATED_API_KEY'),
+        'x-rapidapi-host': 'deprecated.host',
+      },
+    });
+  }
+
+  async getFixtures(leagueId: number, season: number) {
+    return this.rateLimiter.executeRequest(
+      'deprecated-api',
+      async () => {
+        const response = await this.axiosInstance.get('/fixtures', {
+          params: { league: leagueId, season },
+        });
+        
+        this.logger.log(`Fetched ${response.data.results} fixtures for league ${leagueId}`);
+        return response.data.response;
+      },
+    );
+  }
+
+  async getFixturesByDateRange(from: string, to: string) {
+    return this.rateLimiter.executeRequest(
+      'deprecated-api',
+      async () => {
+        const response = await this.axiosInstance.get('/fixtures', {
+          params: { from, to },
+        });
+        return response.data.response;
+      },
+    );
+  }
+
+  async getLiveFixtures(leagueId?: number) {
+    return this.rateLimiter.executeRequest(
+      'deprecated-api',
+      async () => {
+        const params = leagueId ? { live: leagueId } : { live: 'all' };
+        const response = await this.axiosInstance.get('/fixtures', { params });
+        return response.data.response;
+      },
+    );
+  }
+
+  async getStandings(leagueId: number, season: number) {
+    return this.rateLimiter.executeRequest(
+      'deprecated-api',
+      async () => {
+        const response = await this.axiosInstance.get('/standings', {
+          params: { league: leagueId, season },
+        });
+        return response.data.response[0]?.league.standings[0] || [];
+      },
+    );
+  }
+
+  async getH2H(team1Id: number, team2Id: number, last: number = 10) {
+    return this.rateLimiter.executeRequest(
+      'deprecated-api',
+      async () => {
+        const response = await this.axiosInstance.get('/fixtures/headtohead', {
+          params: { h2h: `${team1Id}-${team2Id}`, last },
+        });
+        return response.data.response;
+      },
+    );
+  }
+
+  async getTeamStatistics(leagueId: number, season: number, teamId: number) {
+    return this.rateLimiter.executeRequest(
+      'deprecated-api',
+      async () => {
+        const response = await this.axiosInstance.get('/teams/statistics', {
+          params: { league: leagueId, season, team: teamId },
+        });
+        return response.data.response;
+      },
+    );
+  }
+
+  async getInjuries(leagueId: number, season: number, teamId?: number) {
+    return this.rateLimiter.executeRequest(
+      'deprecated-api',
+      async () => {
+        const params: any = { league: leagueId, season };
+        if (teamId) params.team = teamId;
+        
+        const response = await this.axiosInstance.get('/injuries', { params });
+        return response.data.response;
+      },
+    );
+  }
+
+  async getAPIPrediction(fixtureId: number) {
+    return this.rateLimiter.executeRequest(
+      'deprecated-api',
+      async () => {
+        const response = await this.axiosInstance.get('/predictions', {
+          params: { fixture: fixtureId },
+        });
+        return response.data.response[0];
+      },
+    );
+  }
+
+  async getOdds(fixtureId: number, bookmakerId: number = 8) {
+    return this.rateLimiter.executeRequest(
+      'deprecated-api',
+      async () => {
+        const response = await this.axiosInstance.get('/odds', {
+          params: { fixture: fixtureId, bookmaker: bookmakerId },
+        });
+        return response.data.response;
+      },
+    );
+  }
+}
+```
+
+### Error Handling Best Practices
+
+```typescript
+// Add interceptor for error handling
+this.axiosInstance.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.response) {
+      const { status, data } = error.response;
+      
+      // Rate limit exceeded
+      if (status === 429) {
+        this.logger.error('External API rate limit exceeded');
+        throw new HttpException(
+          'API rate limit exceeded. Please try again later.',
+          HttpStatus.TOO_MANY_REQUESTS,
+        );
+      }
+      
+      // Invalid API key
+      if (status === 401 || status === 403) {
+        this.logger.error('External API authentication failed');
+        throw new HttpException(
+          'API authentication failed',
+          HttpStatus.UNAUTHORIZED,
+        );
+      }
+      
+      // API error
+      this.logger.error(`External API error: ${data.message || 'Unknown error'}`);
+      throw new HttpException(
+        data.message || 'External API error',
+        HttpStatus.BAD_GATEWAY,
+      );
+    }
+    
+    throw error;
+  },
+);
+```
+
+### Testing the Integration
+
+```typescript
+// Test script: scripts/test-deprecated-api.ts
+import axios from 'axios';
+import * as dotenv from 'dotenv';
+
+dotenv.config();
+
+const apiKey = process.env.DEPRECATED_API_KEY;
+const baseURL = 'https://v3.football.api-sports.io';
+
+async function testAPI() {
+  try {
+    // Test 1: Get Premier League fixtures
+    console.log('Testing fixtures endpoint...');
+    const fixturesResponse = await axios.get(`${baseURL}/fixtures`, {
+      params: { league: 39, season: 2024, next: 5 },
+      headers: {
+        'x-rapidapi-key': apiKey,
+        'x-rapidapi-host': 'v3.football.api-sports.io',
+      },
+    });
+    console.log(`✅ Fixtures: ${fixturesResponse.data.results} matches found`);
+
+    // Test 2: Get standings
+    console.log('\nTesting standings endpoint...');
+    const standingsResponse = await axios.get(`${baseURL}/standings`, {
+      params: { league: 39, season: 2024 },
+      headers: {
+        'x-rapidapi-key': apiKey,
+        'x-rapidapi-host': 'v3.football.api-sports.io',
+      },
+    });
+    console.log('✅ Standings retrieved successfully');
+
+    // Test 3: Check API quota
+    const quotaInfo = fixturesResponse.headers['x-ratelimit-requests-remaining'];
+    console.log(`\n📊 Requests remaining today: ${quotaInfo}`);
+
+  } catch (error) {
+    console.error('❌ API Test Failed:', error.message);
+    if (error.response) {
+      console.error('Response:', error.response.data);
+    }
+  }
+}
+
+testAPI();
+```
+
+Run test:
+```bash
+npm run ts-node scripts/test-deprecated-api.ts
+```
+
+---
+
+-->
 ## Custom ML Prediction Approach
 
 > [!TIP]
@@ -615,17 +1256,8 @@ export class ApiRateLimiterService {
       },
     }));
     
-    // API-Football: 100 req/day, 10 req/min
-    this.queues.set('api-football', new Queue('api-football-api', {
-      redis: this.redis,
-      limiter: {
-        max: 10,
-        duration: 60000,
-      },
-    }));
-    
-    // OpenWeatherMap: 1000 req/day, 60 req/min
-    this.queues.set('openweathermap', new Queue('weather-api', {
+    // Open-Meteo: unlimited (soft cap 60 req/min)
+    this.queues.set('open-meteo', new Queue('weather-api', {
       redis: this.redis,
       limiter: {
         max: 60,
@@ -687,9 +1319,9 @@ export class ApiRateLimiterService {
     const count = await this.redis.get(key);
     
     const limits = {
-      'api-football': 100,
       'football-data': Infinity,
-      'openweathermap': 1000,
+      'open-meteo': Infinity,
+      'fantasy-pl': Infinity,
       'odds-api': 17,
     };
     
@@ -719,9 +1351,9 @@ export class ApiRateLimiterService {
     const count = await this.redis.get(key);
     
     const limits = {
-      'api-football': 100,
       'football-data': Infinity,
-      'openweathermap': 1000,
+      'open-meteo': Infinity,
+      'fantasy-pl': Infinity,
       'odds-api': 17,
     };
     
@@ -785,8 +1417,8 @@ export class TeamService {
   
   @Cacheable(3600, 'h2h') // Cache for 1 hour
   async getHeadToHead(team1Id: number, team2Id: number) {
-    // Expensive API call
-    return await this.apiFootballService.getH2H(team1Id, team2Id);
+    // Derived from stored matches
+    return await this.fixtureService.getHeadToHead(team1Id, team2Id);
   }
   
   @Cacheable(1800, 'team-form') // Cache for 30 minutes
@@ -832,32 +1464,30 @@ src/
 │       ├── api-rate-limiter.service.ts
 │       └── cache.service.ts
 │
-├── modules/
-│   ├── football/
-│   │   ├── football.module.ts
-│   │   ├── entities/
-│   │   │   ├── team.entity.ts
-│   │   │   ├── fixture.entity.ts
-│   │   │   ├── standing.entity.ts
-│   │   │   └── match-statistics.entity.ts
-│   │   ├── services/
-│   │   │   ├── football-data-api.service.ts   # Primary API
-│   │   │   ├── api-football.service.ts        # Secondary
-│   │   │   ├── openliga.service.ts            # Backup
-│   │   │   ├── fantasy-pl.service.ts          # PL injuries
-│   │   │   ├── weather-api.service.ts         # Weather data
-│   │   │   ├── odds-api.service.ts            # Market odds
-│   │   │   ├── data-aggregator.service.ts     # Combines all
-│   │   │   ├── team.service.ts
-│   │   │   ├── fixture.service.ts
-│   │   │   └── standing.service.ts
-│   │   ├── controllers/
-│   │   │   ├── team.controller.ts
-│   │   │   ├── fixture.controller.ts
-│   │   │   └── standing.controller.ts
-│   │   └── dto/
-│   │       ├── create-fixture.dto.ts
-│   │       └── update-team.dto.ts
+│   ├── modules/
+│   │   ├── football/
+│   │   │   ├── football.module.ts
+│   │   │   ├── entities/
+│   │   │   │   ├── team.entity.ts
+│   │   │   │   ├── fixture.entity.ts
+│   │   │   │   ├── standing.entity.ts
+│   │   │   │   └── match-statistics.entity.ts
+│   │   │   ├── services/
+│   │   │   │   ├── football-data-org.service.ts   # PRIMARY - Main data source
+│   │   │   │   ├── fantasy-pl.service.ts          # PL injuries & stats
+│   │   │   │   ├── weather-api.service.ts         # Weather data
+│   │   │   │   ├── statsbomb.service.ts           # Historical xG data
+│   │   │   │   ├── data-aggregator.service.ts     # Combines all sources
+│   │   │   │   ├── team.service.ts
+│   │   │   │   ├── fixture.service.ts
+│   │   │   │   └── standing.service.ts
+│   │   │   ├── controllers/
+│   │   │   │   ├── team.controller.ts
+│   │   │   │   ├── fixture.controller.ts
+│   │   │   │   └── standing.controller.ts
+│   │   │   └── dto/
+│   │   │       ├── create-fixture.dto.ts
+│   │   │       └── update-team.dto.ts
 │   │
 │   ├── predictions/
 │   │   ├── predictions.module.ts
@@ -1295,17 +1925,57 @@ export class FeatureEngineeringService {
 
 ## Data Sync Strategy
 
-| Data | Source | Frequency | Cron | Priority | Notes |
-|------|--------|-----------|------|----------|-------|
-| **Fixtures** | Football-Data.org | 2x daily | `0 6,18 * * *` | High | Next 14 days |
-| **Standings** | Football-Data.org | After each matchday | `0 2 * * 1` | High | League tables |
-| **Team Stats** | Calculated | After sync | `0 3 * * *` | Medium | Form, averages |
-| **H2H** | API-Football | On demand | Cached 7 days | Medium | Limited daily quota |
-| **Injuries** | Fantasy PL + Scraping | 4x daily | `0 */6 * * *` | High | All leagues |
-| **Weather** | OpenWeatherMap | 1 day before match | `0 10 * * *` | Low | Match conditions |
-| **Odds** | OddsAPI | 2x daily | `0 8,20 * * *` | Low | Market wisdom |
-| **Predictions** | Internal | After fixture sync | `0 4 * * *` | High | Generate upcoming |
-| **Model Metrics** | After match | Real-time | Event-driven | High | Track accuracy |
+### Updated Strategy with football-data.org (10 req/min budget)
+
+| Data | Source | Frequency | Cron | Requests | Priority | Notes |
+|------|--------|-----------|------|----------|----------|-------|
+| **Fixtures** | football-data.org | 2x daily | `0 7,19 * * *` | 10 (5 leagues × 2) | High | Next 14 days |
+| **Standings** | football-data.org | Daily (Mon-Fri) | `0 2 * * 1-5` | 5 (one per league) | High | League tables |
+| **Team Stats** | Internal (from fixtures) | 2x weekly | `0 3 * * 1,4` | 0 | Medium | Derived aggregates |
+| **H2H / Recent Form** | Internal (from fixtures) | On demand | Cached 7 days | 0 | Medium | From stored matches |
+| **Injuries** | Fantasy PL + Manual (non-PL) | 2x daily | `0 7,19 * * *` | 0 | High | PL only + manual |
+| **Live Scores** | football-data.org | Match days only | `*/15 * * * *` during matches | 10-15 | Medium | Status polling within rate limit |
+| **Weather** | Open-Meteo | Daily | `0 10 * * *` | 10-15 | Low | Free tier |
+| **Predictions** | Internal | Daily | `0 4 * * *` | 0 | High | Generate from cached data |
+| **Model Metrics** | After match | Event-driven | Real-time | 0 | High | Track accuracy |
+
+**Request Budget**: Keep football-data.org calls within 10 req/min (use 6s pacing + caching).
+
+### Request Optimization Strategies
+
+```typescript
+// 1. Stagger per-league requests with pacing
+async syncAllLeaguesFixtures() {
+  const leagues = ['PL', 'PD', 'BL1', 'SA', 'FL1'];
+  const dateFrom = new Date().toISOString().split('T')[0];
+  const dateTo = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+  const results = [];
+  
+  for (const code of leagues) {
+    const matches = await this.footballDataOrg.getCompetitionMatches(code, {
+      dateFrom,
+      dateTo,
+    });
+    results.push(...matches);
+    await this.delay(6000); // 10 req/min pacing
+  }
+  
+  return results;
+}
+
+// 2. Cache aggressively
+@Cacheable(43200, 'standings') // 12 hours
+async getStandings(leagueCode: string) {
+  return this.footballDataOrg.getStandings(leagueCode);
+}
+
+// 3. Skip requests on non-match days
+async shouldSyncLiveScores(): Promise<boolean> {
+  const today = new Date().getDay();
+  // Most matches are Sat(6), Sun(0), Wed(3), Thu(4)
+  return [0, 3, 4, 6].includes(today);
+}
+```
 
 ---
 
@@ -1376,30 +2046,30 @@ export class SyncSchedule {
     private standingsSyncProcessor: StandingsSyncProcessor,
     private injuriesScraperProcessor: InjuriesScraperProcessor,
     private weatherSyncProcessor: WeatherSyncProcessor,
-    private oddsSyncProcessor: OddsSyncProcessor,
     private predictionService: PredictionService,
     private modelMonitoringService: ModelMonitoringService,
     private modelTrainingProcessor: ModelTrainingProcessor,
+    private footballDataOrgService: FootballDataOrgService,
   ) {}
   
-  // Every 6 hours - update fixtures (6 AM, 12 PM, 6 PM, 12 AM)
-  @Cron('0 */6 * * *')
+  // Twice daily at 7 AM and 7 PM - update fixtures
+  @Cron('0 7,19 * * *')
   async syncFixtures() {
-    this.logger.log('Starting fixtures sync');
+    this.logger.log('Starting fixtures sync from football-data.org');
     await this.fixturesSyncProcessor.process();
   }
   
-  // Every Monday at 2 AM - update standings (after weekend matches)
-  @Cron('0 2 * * 1')
+  // Every Monday-Friday at 2 AM - update standings (after matches)
+  @Cron('0 2 * * 1-5')
   async syncStandings() {
-    this.logger.log('Starting standings sync');
+    this.logger.log('Starting standings sync from football-data.org');
     await this.standingsSyncProcessor.process();
   }
   
-  // Every 6 hours - scrape injuries
-  @Cron('0 */6 * * *')
+  // Twice daily at 7 AM and 7 PM - sync injuries
+  @Cron('0 7,19 * * *')
   async syncInjuries() {
-    this.logger.log('Starting injuries sync');
+    this.logger.log('Starting injuries sync from Fantasy PL + manual entry');
     await this.injuriesScraperProcessor.process();
   }
   
@@ -1408,13 +2078,6 @@ export class SyncSchedule {
   async syncWeather() {
     this.logger.log('Starting weather sync');
     await this.weatherSyncProcessor.process();
-  }
-  
-  // Twice daily at 8 AM and 8 PM - fetch odds
-  @Cron('0 8,20 * * *')
-  async syncOdds() {
-    this.logger.log('Starting odds sync');
-    await this.oddsSyncProcessor.process();
   }
   
   // Every day at 4 AM - generate predictions for next 7 days
@@ -1430,6 +2093,61 @@ export class SyncSchedule {
         this.logger.error(`Failed to generate prediction for fixture ${fixture.id}: ${error.message}`);
       }
     }
+  }
+  
+  // Every day at 3 AM - check if model needs retraining
+  @Cron('0 3 * * *')
+  async checkModelRetrain() {
+    this.logger.log('Checking if model needs retraining');
+    const driftStatus = await this.modelMonitoringService.checkModelDrift();
+    
+    if (driftStatus.isDrifting) {
+      this.logger.warn('Model drift detected - scheduling retraining');
+      await this.modelTrainingProcessor.scheduleRetrain();
+    }
+  }
+  
+  // Every 15 minutes during match days - check live scores
+  @Cron('*/15 * * * *')
+  async syncLiveScores() {
+    const shouldSync = await this.shouldSyncLiveScores();
+    if (!shouldSync) return;
+    
+    this.logger.log('Syncing live scores');
+    const liveFixtures = await this.footballDataOrgService.getLiveMatches();
+    await this.fixtureService.updateLiveScores(liveFixtures);
+  }
+  
+  // Helper: Check if today is a match day
+  private async shouldSyncLiveScores(): Promise<boolean> {
+    const today = new Date().getDay();
+    // Most matches: Sat(6), Sun(0), Wed(3), Thu(4), Tue(2)
+    return [0, 2, 3, 4, 6].includes(today);
+  }
+  
+  // Every hour - clean up old cache entries
+  @Cron('0 * * * *')
+  async cleanupCache() {
+    await this.cacheService.cleanup();
+  }
+  
+  // Event-driven: After each match finishes
+  @OnEvent('match.finished')
+  async onMatchFinished(event: MatchFinishedEvent) {
+    this.logger.log(`Match ${event.fixtureId} finished - updating metrics`);
+    
+    // Update model metrics
+    const prediction = await this.predictionService.findByFixture(event.fixtureId);
+    if (prediction) {
+      await this.modelMonitoringService.trackAccuracy(prediction, event.result);
+    }
+    
+    // Update team form
+    await this.teamService.recalculateForm(event.homeTeamId);
+    await this.teamService.recalculateForm(event.awayTeamId);
+  }
+}
+```
   }
   
   // Every day at 3 AM - check if model needs retraining
@@ -1617,13 +2335,13 @@ def test_feature_importance():
 
 **Goals**: Set up basic infrastructure and data collection
 
-- [ ] NestJS project setup with TypeORM + PostgreSQL
-- [ ] Redis configuration for caching
-- [ ] Football-Data.org integration
-- [ ] Core entities (Team, Fixture, Standing)
-- [ ] Basic sync jobs (fixtures, standings)
-- [ ] API endpoints for fixtures and teams
-- [ ] Unit tests for services
+- [x] NestJS project setup with TypeORM + PostgreSQL
+- [x] Redis configuration for caching
+- [x] Football-Data.org integration
+- [x] Core entities (Team, Fixture, Standing)
+- [x] Basic sync jobs (fixtures, standings)
+- [x] API endpoints for fixtures and teams
+- [x] Unit tests for services
 
 **Deliverables**:
 - Working API that fetches and stores fixture data
@@ -1634,14 +2352,14 @@ def test_feature_importance():
 
 **Goals**: Build comprehensive data collection system
 
-- [ ] Multi-API aggregation service
+- [x] Multi-API aggregation service
 - [ ] API rate limiter implementation
-- [ ] Redis caching layer with TTL strategy
-- [ ] Injury data collection (FPL API + scraping)
-- [ ] Weather API integration
+- [x] Redis caching layer with TTL strategy
+- [x] Injury data collection (FPL API - PL only)
+- [x] Weather API integration
 - [ ] Odds API integration
-- [ ] Data quality validation service
-- [ ] Feature engineering service (basic)
+- [x] Data quality validation service
+- [x] Feature engineering service (basic)
 
 **Deliverables**:
 - Complete data aggregation from all sources
@@ -1653,14 +2371,14 @@ def test_feature_importance():
 **Goals**: Build and train prediction models
 
 - [ ] Collect 2+ seasons of historical data
-- [ ] Feature extraction pipeline (Python)
-- [ ] Train baseline model (Logistic Regression)
-- [ ] Train XGBoost model
-- [ ] Train Random Forest model
+- [x] Feature extraction pipeline (Python)
+- [x] Train baseline model (Logistic Regression)
+- [x] Train XGBoost model
+- [x] Train Random Forest model
 - [ ] Train Poisson Regression model
-- [ ] Model evaluation and comparison
-- [ ] Export to ONNX format
-- [ ] Hyperparameter tuning
+- [x] Model evaluation and comparison
+- [x] Export to ONNX format
+- [x] Hyperparameter tuning
 
 **Deliverables**:
 - Trained models with >45% accuracy
@@ -1671,14 +2389,14 @@ def test_feature_importance():
 
 **Goals**: Integrate models into NestJS backend
 
-- [ ] ONNX Runtime integration in NestJS
-- [ ] ML inference service
-- [ ] Prediction service with ensemble
-- [ ] Confidence scoring system
-- [ ] Prediction API endpoints
-- [ ] Model monitoring service
-- [ ] Drift detection system
-- [ ] Accuracy tracking and alerting
+- [x] ONNX Runtime integration in NestJS
+- [x] ML inference service
+- [x] Prediction service with ensemble
+- [x] Confidence scoring system
+- [x] Prediction API endpoints
+- [x] Model monitoring service
+- [x] Drift detection system
+- [x] Accuracy tracking (basic)
 
 **Deliverables**:
 - Working prediction API
@@ -1689,9 +2407,9 @@ def test_feature_importance():
 
 **Goals**: Improve accuracy and add advanced features
 
-- [ ] Enhanced injury impact scoring
-- [ ] Manager tenure tracking
-- [ ] Advanced feature engineering
+- [x] Enhanced injury impact scoring
+- [ ] Manager tenure tracking (dropped)
+- [x] Advanced feature engineering
 - [ ] Model retraining pipeline
 - [ ] A/B testing framework
 - [ ] Performance optimization
@@ -1797,17 +2515,30 @@ if (predictionAge > 24 * 60 * 60 * 1000) {
 
 ## Cost Breakdown: $0
 
-| Service | Solution | Cost |
-|---------|----------|------|
-| **Football Data** | Football-Data.org (free) + API-Football (free tier) | $0 |
-| **Weather Data** | OpenWeatherMap (free tier - 1000 req/day) | $0 |
-| **Odds Data** | OddsAPI (free tier - 500 req/month) | $0 |
-| **Database** | PostgreSQL (local) or Supabase/Neon free tier | $0 |
-| **Cache** | Redis (local) or Upstash free tier | $0 |
-| **Hosting** | Local development / Railway/Render free tier | $0 |
-| **Monitoring** | Prometheus + Grafana (self-hosted) | $0 |
+| Service | Solution | Free Tier Limits | Cost |
+|---------|----------|------------------|------|
+| **Football Data** | football-data.org v4 (primary) | 10 req/min | $0 |
+| **Player Stats** | Fantasy Premier League API | Unlimited | $0 |
+| **Weather Data** | Open-Meteo | Unlimited | $0 |
+| **Historical xG** | StatsBomb Open Data | Unlimited (GitHub) | $0 |
+| **Database** | PostgreSQL (local) or Supabase free tier (500MB) | 500MB | $0 |
+| **Cache** | Redis (local) or Upstash free tier (10K commands/day) | 10K/day | $0 |
+| **Hosting** | Local dev / Railway free tier (500 hrs/month) | 500 hrs/month | $0 |
+| **Monitoring** | Prometheus + Grafana (self-hosted) | Unlimited | $0 |
 
 **Total Monthly Cost**: $0
+
+### Why This is Sustainable
+
+- football-data.org free tier with pacing (10 req/min)
+- Smart caching reduces API calls by 70-80%
+- Staggered per-league syncs keep within limits
+- Off-peak syncs reduce load
+- Local development avoids production costs
+
+### Upgrade Path (When Ready to Scale)
+
+If you outgrow the free tier, move to football-data.org paid tiers for higher rate limits and broader coverage.
 
 ---
 
@@ -1851,42 +2582,85 @@ if (predictionAge > 24 * 60 * 60 * 1000) {
 
 ## Resources & References
 
-### APIs
-- [Football-Data.org Documentation](https://www.football-data.org/documentation/quickstart)
-- [API-Football Documentation](https://www.api-football.com/documentation-v3)
-- [Fantasy Premier League API](https://fantasy.premierleague.com/api/bootstrap-static/)
-- [OpenWeatherMap API](https://openweathermap.org/api)
-- [The Odds API](https://the-odds-api.com/)
+### APIs (Primary)
+- **[football-data.org v4 Documentation](football-data-org-v4-complete-documentation.md)** - Primary data source
+- **[football-data.org Account](https://www.football-data.org/client/register)** - Manage your API key
+- [Fantasy Premier League API](https://fantasy.premierleague.com/api/bootstrap-static/) - Free PL injuries
+- [Open-Meteo API](https://open-meteo.com/) - Weather data
+- [StatsBomb Open Data](https://github.com/statsbomb/open-data) - Historical xG data
+
+### football-data.org Resources
+- **[football-data.org v4 Documentation](football-data-org-v4-complete-documentation.md)** - Endpoints and examples
+- **[football-data.org Website](https://www.football-data.org/)** - Updates and account management
 
 ### ML Resources
 - [XGBoost Documentation](https://xgboost.readthedocs.io/)
 - [ONNX Runtime Node.js](https://onnxruntime.ai/docs/get-started/with-javascript.html)
 - [scikit-learn](https://scikit-learn.org/)
+- [Poisson Distribution for Football](https://www.pinnacle.com/en/betting-articles/Soccer/how-to-calculate-poisson-distribution/)
 
 ### NestJS Resources
 - [NestJS Documentation](https://docs.nestjs.com/)
 - [TypeORM Documentation](https://typeorm.io/)
 - [Bull Queue](https://docs.bullmq.io/)
+- [NestJS Schedule](https://docs.nestjs.com/techniques/task-scheduling)
+
+### Football Analytics
+- [StatsBomb Articles](https://statsbomb.com/articles/) - Advanced analytics
+- [Football xG Explained](https://theanalyst.com/na/2021/07/what-are-expected-goals-xg/)
+- [Betting Odds Explained](https://help.smarkets.com/hc/en-gb/articles/214058369-How-to-calculate-implied-probability-in-betting)
 
 ---
 
 ## Conclusion
 
-This comprehensive plan provides a complete roadmap for building a sophisticated football prediction system using AI/ML. The architecture is designed to be:
+This comprehensive plan provides a complete roadmap for building a sophisticated football prediction system using AI/ML with **football-data.org as the primary data source**. The architecture is designed to be:
 
 - **Scalable**: Can handle multiple leagues and thousands of predictions
 - **Maintainable**: Clear module separation and coding standards
 - **Accurate**: Advanced ML models with continuous monitoring
-- **Cost-effective**: Entirely free tier APIs and services
+- **Cost-effective**: Free-tier APIs with football-data.org (10 req/min pacing)
 - **Production-ready**: Includes testing, monitoring, and deployment strategies
+- **Reliable**: football-data.org with caching + retries and fallback data
 
 The phased implementation approach ensures you can build incrementally, validating each component before moving to the next. Start with the foundation, get data flowing, then add ML capabilities, and finally optimize for production.
 
 **Key Success Factors**:
-1. Data quality is paramount - invest time in validation
-2. Start simple (baseline models) before going complex
-3. Monitor everything - you can't improve what you don't measure
-4. Retrain regularly as leagues evolve
-5. Be realistic about accuracy - 50-55% is excellent for football
+1. **Data quality is paramount** - invest time in validation and the Data Quality Service
+2. **Start simple** - baseline models (Logistic Regression) before complex (XGBoost)
+3. **Monitor everything** - you can't improve what you don't measure
+4. **Retrain regularly** - leagues evolve, models drift
+5. **Be realistic about accuracy** - 50-55% is excellent for football predictions
+6. **Manage API quota wisely** - 10 req/min requires pacing, caching, and batching
+
+### Quick Start Checklist
+
+Before you begin coding:
+
+- [ ] Sign up for football-data.org at https://www.football-data.org/
+- [ ] Get your API key from your account
+- [ ] Test football-data.org with a sample request
+- [ ] Set up local PostgreSQL database
+- [ ] Set up local Redis instance
+- [ ] Clone or create NestJS project structure
+- [ ] Configure environment variables (.env)
+- [ ] Install dependencies (npm install)
+- [ ] Run a quick football-data.org request to verify connection
+- [ ] Review the football-data.org Integration Guide section above
+- [ ] Proceed with Phase 1 implementation
+
+### Why football-data.org?
+
+We use football-data.org because:
+
+- Free tier fits within 10 req/min with pacing
+- Current-season coverage for the top leagues
+- Simple, stable endpoints for fixtures, teams, standings
+- Works well with caching and retry logic
+- Pairs cleanly with FPL + manual injury inputs
 
 Good luck with your build! 🚀⚽
+
+---
+
+**Need help?** Check the [football-data.org documentation](football-data-org-v4-complete-documentation.md) or the [football-data.org site](https://www.football-data.org/).

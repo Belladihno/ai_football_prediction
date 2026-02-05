@@ -5,16 +5,18 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { League } from '../../football/entities/league.entity';
 import { TeamService } from '../../football/services/team.service';
 import { FixtureService } from '../../football/services/fixture.service';
-import { FootballDataApiService } from '../../football/services/football-data-api.service';
+import { StandingsService } from '../../football/services/standings.service';
+import { InjuryService } from '../../football/services/injury.service';
+import { FootballDataOrgService, COMPETITION_CODES } from '../../football/services/football-data-org.service';
 
-// League codes for top 5 European leagues
-const LEAGUE_CODES = {
-  PL: 'Premier League',
-  PD: 'La Liga',
-  BL1: 'Bundesliga',
-  SA: 'Serie A',
-  FL1: 'Ligue 1',
-};
+// League codes mapped to football-data.org competition codes
+const LEAGUES = [
+  { code: 'PL', name: 'Premier League', competitionCode: COMPETITION_CODES.PREMIER_LEAGUE },
+  { code: 'PD', name: 'La Liga', competitionCode: COMPETITION_CODES.LA_LIGA },
+  { code: 'BL1', name: 'Bundesliga', competitionCode: COMPETITION_CODES.BUNDESLIGA },
+  { code: 'SA', name: 'Serie A', competitionCode: COMPETITION_CODES.SERIE_A },
+  { code: 'FL1', name: 'Ligue 1', competitionCode: COMPETITION_CODES.LIGUE_1 },
+];
 
 @Injectable()
 export class SyncService {
@@ -25,7 +27,9 @@ export class SyncService {
     private leagueRepository: Repository<League>,
     private teamService: TeamService,
     private fixtureService: FixtureService,
-    private footballApi: FootballDataApiService,
+    private standingsService: StandingsService,
+    private injuryService: InjuryService,
+    private footballData: FootballDataOrgService,
   ) {}
 
   // Sync teams and fixtures every 6 hours
@@ -34,8 +38,10 @@ export class SyncService {
     this.logger.log('Starting scheduled data sync');
 
     try {
-      for (const [code, name] of Object.entries(LEAGUE_CODES)) {
-        await this.syncLeague(code, name);
+      await this.injuryService.syncPremierLeagueInjuries();
+
+      for (const league of LEAGUES) {
+        await this.syncLeague(league.code, league.name, league.competitionCode);
       }
 
       this.logger.log('Data sync completed successfully');
@@ -45,7 +51,7 @@ export class SyncService {
   }
 
   // Sync a single league
-  async syncLeague(code: string, name: string): Promise<void> {
+  async syncLeague(code: string, name: string, competitionCode: string): Promise<void> {
     this.logger.log(`Syncing ${name} (${code})`);
 
     // Find or create league
@@ -61,58 +67,90 @@ export class SyncService {
     }
 
     // Sync teams
-    const teamResult = await this.teamService.syncTeams(code, league.id);
+    const teamResult = await this.teamService.syncTeams(competitionCode, league.id);
     this.logger.log(`${name} teams: ${teamResult.created} created, ${teamResult.updated} updated`);
 
-    // Sync fixtures
-    const fixtureResult = await this.fixtureService.syncFixtures(code, league.id);
+    // Add delay to avoid rate limiting (10 requests/minute)
+    await this.delay(6000);
+
+    // Sync standings
+    await this.standingsService.syncStandings(competitionCode, league.id);
+
+    // Add delay to avoid rate limiting (10 requests/minute)
+    await this.delay(6000);
+
+    // Sync fixtures (all - upcoming and historical)
+    const fixtureResult = await this.fixtureService.syncAllFixtures(competitionCode, league.id);
     this.logger.log(`${name} fixtures: ${fixtureResult.created} created, ${fixtureResult.updated} updated`);
   }
 
+  /**
+   * Helper delay function
+   */
+  private delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
   // Manually trigger sync
-  async triggerSync(): Promise<{ leagues: number; teams: number; fixtures: number }> {
+  async triggerSync(): Promise<{ leagues: number; teams: number; fixtures: number; historical: number }> {
     this.logger.log('Manual sync triggered');
 
     let totalTeamsCreated = 0;
     let totalTeamsUpdated = 0;
     let totalFixturesCreated = 0;
     let totalFixturesUpdated = 0;
+    let leaguesCreated = 0;
 
-    for (const [code, name] of Object.entries(LEAGUE_CODES)) {
-      const teamResult = await this.syncTeamsOnly(code);
-      const fixtureResult = await this.syncFixturesOnly(code);
+    await this.injuryService.syncPremierLeagueInjuries();
 
+    for (let i = 0; i < LEAGUES.length; i++) {
+      const league = LEAGUES[i];
+      
+      // Ensure league exists first
+      let dbLeague = await this.leagueRepository.findOne({ where: { code: league.code } });
+      if (!dbLeague) {
+        dbLeague = this.leagueRepository.create({
+          code: league.code,
+          name: league.name,
+          country: this.getCountryForLeague(league.code),
+        });
+        dbLeague = await this.leagueRepository.save(dbLeague);
+        this.logger.log(`Created league: ${league.name}`);
+        leaguesCreated++;
+      }
+      
+      // Now sync teams
+      const teamResult = await this.teamService.syncTeams(league.competitionCode, dbLeague.id);
       totalTeamsCreated += teamResult.created;
       totalTeamsUpdated += teamResult.updated;
+      
+      // Add delay between teams and fixtures (10 requests/minute)
+      await this.delay(6000);
+
+      // Sync standings
+      await this.standingsService.syncStandings(league.competitionCode, dbLeague.id);
+
+      // Add delay between standings and fixtures (10 requests/minute)
+      await this.delay(6000);
+      
+      // Sync all fixtures
+      const fixtureResult = await this.fixtureService.syncAllFixtures(league.competitionCode, dbLeague.id);
       totalFixturesCreated += fixtureResult.created;
       totalFixturesUpdated += fixtureResult.updated;
+      
+      // Add delay between leagues (10 requests/minute)
+      if (i < LEAGUES.length - 1) {
+        this.logger.log('Waiting 6 seconds before next league...');
+        await this.delay(6000);
+      }
     }
 
     return {
-      leagues: Object.keys(LEAGUE_CODES).length,
+      leagues: leaguesCreated,
       teams: totalTeamsCreated + totalTeamsUpdated,
       fixtures: totalFixturesCreated + totalFixturesUpdated,
+      historical: 0, // Not applicable for football-data.org (no historical data on free tier)
     };
-  }
-
-  // Sync teams only
-  private async syncTeamsOnly(competitionCode: string): Promise<{ created: number; updated: number }> {
-    const league = await this.leagueRepository.findOne({ where: { code: competitionCode } });
-    if (!league) {
-      this.logger.warn(`League ${competitionCode} not found, skipping team sync`);
-      return { created: 0, updated: 0 };
-    }
-    return this.teamService.syncTeams(competitionCode, league.id);
-  }
-
-  // Sync fixtures only
-  private async syncFixturesOnly(competitionCode: string): Promise<{ created: number; updated: number }> {
-    const league = await this.leagueRepository.findOne({ where: { code: competitionCode } });
-    if (!league) {
-      this.logger.warn(`League ${competitionCode} not found, skipping fixture sync`);
-      return { created: 0, updated: 0 };
-    }
-    return this.fixtureService.syncFixtures(competitionCode, league.id);
   }
 
   // Get country for league code

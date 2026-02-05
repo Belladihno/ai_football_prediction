@@ -1,6 +1,6 @@
 export default () => ({
   port: parseInt(process.env.PORT || '3000', 10),
-  apiVersion: process.env.API_VERSION || 'api',
+  apiVersion: process.env.API_VERSION || 'api/v1',
 
   database: {
     host: process.env.DB_HOST || 'localhost',
@@ -18,11 +18,20 @@ export default () => ({
     password: process.env.REDIS_PASSWORD || '',
   },
 
-  footballApi: {
-    baseUrl: 'https://api.football-data.org/v4',
-    apiKey: process.env.FOOTBALL_DATA_API_KEY || 'YOUR_API_KEY_HERE',
+  // football-data.org API Configuration
+  footballDataOrg: {
+    baseUrl: process.env.FOOTBALL_DATA_BASE_URL || 'https://api.football-data.org/v4',
+    apiKey: process.env.FOOTBALL_DATA_API_KEY || '',
   },
 
+  // Odds-API.io Configuration
+  oddsApi: {
+    baseUrl: process.env.ODDS_API_IO_BASE_URL || 'https://api.odds-api.io/v3',
+    apiKey: process.env.ODDS_API_IO_KEY || '',
+    bookmakers: process.env.ODDS_API_IO_BOOKMAKERS || 'Bet365,Unibet',
+  },
+
+  // API-Football Configuration (legacy)
   rateLimit: {
     maxRequests: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || '100', 10),
   },

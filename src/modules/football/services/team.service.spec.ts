@@ -1,14 +1,15 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { TeamService } from './team.service';
-import { FootballDataApiService } from './football-data-api.service';
+import { FootballDataOrgService } from './football-data-org.service';
 import { getRepositoryToken } from '@nestjs/typeorm';
 import { Team } from '../entities/team.entity';
+import { Fixture } from '../entities/fixture.entity';
 import { Repository } from 'typeorm';
 import { NotFoundException } from '@nestjs/common';
 
 describe('TeamService', () => {
   let service: TeamService;
-  let apiService: FootballDataApiService;
+  let apiService: FootballDataOrgService;
   let repository: Repository<Team>;
 
   // Mock data
@@ -54,13 +55,13 @@ describe('TeamService', () => {
     name: 'Manchester United',
     shortName: 'Man United',
     tla: 'MUN',
-    crestUrl: 'https://example.com/mun.png',
+    crest: 'https://example.com/mun.png',
     address: 'Sir Matt Busby Way, Manchester',
     website: 'https://manutd.com',
     founded: 1878,
     clubColors: 'Red / White',
     venue: 'Old Trafford',
-    area: { name: 'England' },
+    area: { id: 2072, name: 'England', code: 'ENG' },
   };
 
   // Mock repository with query builder
@@ -76,6 +77,16 @@ describe('TeamService', () => {
       take: jest.fn().mockReturnThis(),
       getMany: jest.fn(),
       getOne: jest.fn(),
+    })),
+  };
+
+  const mockFixtureRepository = {
+    createQueryBuilder: jest.fn(() => ({
+      where: jest.fn().mockReturnThis(),
+      andWhere: jest.fn().mockReturnThis(),
+      orderBy: jest.fn().mockReturnThis(),
+      limit: jest.fn().mockReturnThis(),
+      getMany: jest.fn().mockResolvedValue([]),
     })),
   };
 
@@ -95,14 +106,18 @@ describe('TeamService', () => {
           useValue: mockRepository,
         },
         {
-          provide: FootballDataApiService,
+          provide: getRepositoryToken(Fixture),
+          useValue: mockFixtureRepository,
+        },
+        {
+          provide: FootballDataOrgService,
           useValue: mockApiService,
         },
       ],
     }).compile();
 
     service = module.get<TeamService>(TeamService);
-    apiService = module.get<FootballDataApiService>(FootballDataApiService);
+    apiService = module.get<FootballDataOrgService>(FootballDataOrgService);
     repository = module.get<Repository<Team>>(getRepositoryToken(Team));
 
     jest.clearAllMocks();
@@ -185,18 +200,29 @@ describe('TeamService', () => {
   });
 
   describe('getForm', () => {
-    it('should return team form as W/D/L string', async () => {
-      const mockTeam = { ...mockTeams[0], externalId: 1 };
-      mockRepository.findOne.mockResolvedValue(mockTeam);
-      mockApiService.getTeamMatches.mockResolvedValue([
-        { status: 'FINISHED', homeTeam: { id: 1 }, score: { fullTime: { home: 2, away: 1 } } },
-        { status: 'FINISHED', homeTeam: { id: 2 }, score: { fullTime: { home: 1, away: 1 } } },
-        { status: 'FINISHED', homeTeam: { id: 1 }, score: { fullTime: { home: 3, away: 0 } } },
-      ]);
+    it('should return team form as W/D/L array', async () => {
+      const builder = (fixtures: any[]) => ({
+        where: jest.fn().mockReturnThis(),
+        andWhere: jest.fn().mockReturnThis(),
+        orderBy: jest.fn().mockReturnThis(),
+        limit: jest.fn().mockReturnThis(),
+        getMany: jest.fn().mockResolvedValue(fixtures),
+      });
 
-      const result = await service.getForm('uuid-1', 3);
+      mockFixtureRepository.createQueryBuilder
+        .mockReturnValueOnce(builder([
+          // team is home and wins 2-1
+          { homeTeamId: 'uuid-1', awayTeamId: 'uuid-2', homeGoals: 2, awayGoals: 1, kickoff: new Date() },
+        ]))
+        .mockReturnValueOnce(builder([
+          // team is away and draws 1-1
+          { homeTeamId: 'uuid-2', awayTeamId: 'uuid-1', homeGoals: 1, awayGoals: 1, kickoff: new Date(Date.now() - 1000) },
+        ]));
 
-      expect(typeof result).toBe('string');
+      const result = await service.getForm('uuid-1', 2);
+
+      expect(Array.isArray(result)).toBe(true);
+      expect(result).toHaveLength(2);
     });
   });
 

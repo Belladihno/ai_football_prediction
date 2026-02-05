@@ -1,12 +1,10 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, LessThan, MoreThan } from 'typeorm';
-import { Cron, CronExpression } from '@nestjs/schedule';
-import { ConfigService } from '@nestjs/config';
-import axios from 'axios';
+import { Repository } from 'typeorm';
 import { Fixture, FixtureStatus } from '../entities/fixture.entity';
 import { Team } from '../entities/team.entity';
 import { League } from '../entities/league.entity';
+import { FootballDataOrgService, FdOMatch } from './football-data-org.service';
 
 /**
  * Historical Data Service
@@ -19,27 +17,9 @@ import { League } from '../entities/league.entity';
  * - Supports historical data from 2020 onwards
  */
 
-interface ApiMatch {
-    id: number;
-    utcDate: string;
-    status: string;
-    matchday: number;
-    homeTeam: { id: number; name: string };
-    awayTeam: { id: number; name: string };
-    score: {
-        fullTime: { home: number | null; away: number | null };
-    };
-}
-
-interface ApiResponse {
-    matches: ApiMatch[];
-}
-
 @Injectable()
 export class HistoricalDataService {
     private readonly logger = new Logger(HistoricalDataService.name);
-    private readonly apiKey: string;
-    private readonly baseUrl = 'https://api.football-data.org/v4';
 
     // Supported leagues for historical data
     private readonly LEAGUES = [
@@ -60,9 +40,8 @@ export class HistoricalDataService {
         private teamRepository: Repository<Team>,
         @InjectRepository(League)
         private leagueRepository: Repository<League>,
-        private configService: ConfigService,
+        private footballData: FootballDataOrgService,
     ) {
-        this.apiKey = this.configService.get<string>('footballApi.apiKey') || '';
     }
 
     /**
@@ -107,24 +86,11 @@ export class HistoricalDataService {
     async collectSeasonData(leagueCode: string, season: string): Promise<number> {
         this.logger.log(`Collecting ${leagueCode} season ${season}...`);
 
-        if (!this.apiKey) {
-            this.logger.warn('No API key configured, skipping historical data collection');
-            return 0;
-        }
-
         try {
-            const response = await axios.get<ApiResponse>(
-                `${this.baseUrl}/competitions/${leagueCode}/matches`,
-                {
-                    headers: { 'X-Auth-Token': this.apiKey },
-                    params: {
-                        season: season,
-                        status: 'FINISHED',
-                    },
-                }
-            );
-
-            const matches = response.data.matches || [];
+            const matches = await this.footballData.getMatches(leagueCode, {
+                season,
+                status: 'FINISHED',
+            });
             this.logger.log(`Found ${matches.length} finished matches`);
 
             // Get or create league
@@ -153,7 +119,7 @@ export class HistoricalDataService {
     /**
      * Save a single match to the database
      */
-    private async saveMatch(match: ApiMatch, league: League): Promise<boolean> {
+    private async saveMatch(match: FdOMatch, league: League): Promise<boolean> {
         // Check if match already exists
         const existing = await this.fixtureRepository.findOne({
             where: { externalId: match.id },

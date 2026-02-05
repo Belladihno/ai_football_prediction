@@ -94,11 +94,14 @@ class BaselineModels:
         y_test: np.ndarray
     ) -> Dict:
         """Train and evaluate logistic regression."""
+        # Tuned hyperparameters from hyperparameter_tuning.py
         model = LogisticRegression(
-            max_iter=1000,
-            solver='lbfgs',
+            C=1,
+            penalty='l1',
+            solver='saga',
+            max_iter=500,
+            class_weight=None,
             random_state=self.random_state,
-            C=1.0,
         )
 
         model.fit(X_train, y_train)
@@ -123,10 +126,17 @@ class BaselineModels:
         y_test: np.ndarray
     ) -> Dict:
         """Train and evaluate XGBoost."""
+        # Tuned hyperparameters from hyperparameter_tuning.py
         model = xgb.XGBClassifier(
             n_estimators=100,
-            max_depth=6,
-            learning_rate=0.1,
+            max_depth=5,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.6,
+            gamma=0.2,
+            reg_alpha=0.1,
+            reg_lambda=10,
+            min_child_weight=3,
             random_state=self.random_state,
             eval_metric='mlogloss',
         )
@@ -153,9 +163,15 @@ class BaselineModels:
         y_test: np.ndarray
     ) -> Dict:
         """Train and evaluate random forest."""
+        # Tuned hyperparameters from hyperparameter_tuning.py
         model = RandomForestClassifier(
-            n_estimators=100,
-            max_depth=10,
+            n_estimators=200,
+            max_depth=30,
+            min_samples_split=2,
+            min_samples_leaf=1,
+            max_features='sqrt',
+            criterion='gini',
+            bootstrap=True,
             random_state=self.random_state,
             n_jobs=-1,
         )

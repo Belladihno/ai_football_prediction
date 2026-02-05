@@ -5,6 +5,7 @@ import { ConfigService } from '@nestjs/config';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 import { TransformInterceptor } from './common/interceptors/transform.interceptor';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
@@ -17,7 +18,7 @@ async function bootstrap() {
   // Get config service for environment variables
   const configService = app.get(ConfigService);
   const port = configService.get<number>('port') || 3000;
-  const apiVersion = configService.get<string>('apiVersion') || 'api';
+  const apiVersion = configService.get<string>('apiVersion') || 'api/v1';
 
   // Set global API prefix
   app.setGlobalPrefix(apiVersion);
@@ -49,6 +50,21 @@ async function bootstrap() {
     credentials: true,
   });
 
+  // Swagger API Documentation
+  const swaggerConfig = new DocumentBuilder()
+    .setTitle('Football AI Prediction API')
+    .setDescription('AI-powered football match prediction system with ML models')
+    .setVersion('1.0')
+    .addTag('fixtures', 'Match fixtures and schedules')
+    .addTag('teams', 'Team information and statistics')
+    .addTag('predictions', 'AI match predictions with confidence scores')
+    .addTag('standings', 'League standings')
+    .addTag('sync', 'Data synchronization endpoints')
+    .build();
+
+  const document = SwaggerModule.createDocument(app, swaggerConfig);
+  SwaggerModule.setup('docs', app, document);
+
   // Start the server
   await app.listen(port);
 
@@ -56,6 +72,7 @@ async function bootstrap() {
   const serverUrl = `http://localhost:${port}`;
   logger.log(`Football AI API is running on: ${serverUrl}`);
   logger.log(`API endpoints: ${serverUrl}/${apiVersion}`);
+  logger.log(`Swagger docs: ${serverUrl}/docs`);
 }
 
 bootstrap().catch((error) => {

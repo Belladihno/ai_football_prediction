@@ -57,7 +57,7 @@ class FootballPredictionTrainer:
             random_state=self.config['random_state']
         )
         self.evaluator = ModelEvaluator()
-        self.exporter = ONNXExporter(input_dim=30)
+        self.exporter = ONNXExporter(input_dim=31)
 
         # Results storage
         self.results = {}
@@ -66,6 +66,7 @@ class FootballPredictionTrainer:
 
     def _default_config(self) -> Dict:
         """Default configuration."""
+        current_year = datetime.now().year
         return {
             'random_state': 42,
             'test_size': 0.2,
@@ -78,7 +79,18 @@ class FootballPredictionTrainer:
             'max_samples': 10000,  # Max matches to load
             'min_samples': 500,  # Minimum needed before fallback
             'synthetic_samples': 5000,  # Fallback sample count
+            'fetch_historical_data': True,  # Pull season=YYYY from football-data.org if DB is sparse
+            'historical_seasons': [current_year - 1, current_year - 2],
         }
+
+    def _get_historical_seasons(self) -> Optional[list]:
+        env_seasons = os.environ.get('HISTORICAL_SEASONS')
+        if env_seasons:
+            try:
+                return [int(s.strip()) for s in env_seasons.split(',') if s.strip()]
+            except ValueError:
+                print(f"[WARNING] Invalid HISTORICAL_SEASONS value: {env_seasons}")
+        return self.config.get('historical_seasons')
 
     def load_data(self) -> Tuple[np.ndarray, np.ndarray]:
         """
@@ -98,21 +110,21 @@ class FootballPredictionTrainer:
             try:
                 from training.database_loader import DatabaseLoader
                 from datetime import datetime, timedelta
-                
+
                 loader = DatabaseLoader()
-                
+
                 if loader.connect():
                     # Get matches from the last 2 seasons (approx 2 years)
                     min_date = datetime.now() - timedelta(days=730)
-                    
+
                     X, y = loader.prepare_training_data(
                         min_date=min_date,
                         leagues=self.config.get('leagues', ['PL', 'PD', 'BL1', 'SA', 'FL1']),
                         limit=self.config.get('max_samples', 10000)
                     )
-                    
+
                     loader.disconnect()
-                    
+
                     if len(X) >= self.config.get('min_samples', 500):
                         print(f"[OK] Loaded {len(X)} samples from database")
                         print(f"  Features shape: {X.shape}")
@@ -120,12 +132,48 @@ class FootballPredictionTrainer:
                         return X, y
                     else:
                         print(f"[WARNING] Only {len(X)} samples found, need at least {self.config.get('min_samples', 500)}")
-                        print("  Falling back to synthetic data...")
-                        
+                        print("  Attempting historical data fetch...")
+
             except Exception as e:
                 print(f"[WARNING] Database loading failed: {e}")
+                print("  Attempting historical data fetch...")
+
+        # Try fetching historical data from football-data.org if enabled
+        if self.config.get('fetch_historical_data', True):
+            try:
+                from training.football_data_org_fetcher import FootballDataOrgFetcher
+                from training.database_loader import DatabaseLoader
+                from datetime import datetime, timedelta
+
+                seasons = self._get_historical_seasons() or []
+                leagues = self.config.get('leagues', ['PL', 'PD', 'BL1', 'SA', 'FL1'])
+
+                fetcher = FootballDataOrgFetcher()
+                if seasons and fetcher.can_fetch():
+                    print(f"[INFO] Fetching historical seasons: {seasons}")
+                    fetcher.seed_historical_matches(leagues, seasons)
+
+                    loader = DatabaseLoader()
+                    if loader.connect():
+                        min_season = min(seasons)
+                        min_date = datetime(min_season, 1, 1)
+                        X, y = loader.prepare_training_data(
+                            min_date=min_date,
+                            leagues=leagues,
+                            limit=self.config.get('max_samples', 10000)
+                        )
+                        loader.disconnect()
+
+                        if len(X) >= self.config.get('min_samples', 500):
+                            print(f"[OK] Loaded {len(X)} samples from database after historical sync")
+                            return X, y
+                else:
+                    print("[WARNING] Historical fetch skipped (no seasons or API key missing)")
+
+            except Exception as e:
+                print(f"[WARNING] Historical fetch failed: {e}")
                 print("  Falling back to synthetic data...")
-        
+
         # Fallback: Generate synthetic data
         from training.database_loader import generate_synthetic_data
         
@@ -179,18 +227,80 @@ class FootballPredictionTrainer:
         # Save results
         self._save_results()
 
-        # Export best model to ONNX
-        if self.best_accuracy >= self.config['min_accuracy_threshold']:
-            print(f"\n[INFO] Exporting best model ({self.best_model}) to ONNX...")
-            self._export_best_model(X.shape[1])
-        else:
-            print(f"\n[INFO] Best model accuracy ({self.best_accuracy:.4f}) below threshold")
-            print("  Skipping ONNX export")
+        # Export ALL models to ONNX (for ensemble and comparison)
+        print(f"\n[INFO] Exporting all models to ONNX...")
+        self._export_all_models(X.shape[1])
+
+        # Generate model comparison report
+        self._generate_comparison_report()
 
         print(f"\n[INFO] Training complete at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"   Best model: {self.best_model} (Accuracy: {self.best_accuracy:.4f})")
 
         return self.results
+
+    def _export_all_models(self, input_dim: int) -> None:
+        """
+        Export all trained models to ONNX format.
+
+        Args:
+            input_dim: Number of input features
+        """
+        os.makedirs(self.config['model_dir'], exist_ok=True)
+
+        for name, result in self.results.items():
+            model = result['model']
+            model_path = os.path.join(
+                self.config['model_dir'],
+                f'{name}_v1.onnx'
+            )
+
+            try:
+                if name == 'xgboost':
+                    self.exporter.export_xgboost(model, f'{name}_v1', model_path)
+                elif name == 'random_forest':
+                    self.exporter.export_random_forest(model, f'{name}_v1', model_path)
+                elif name == 'logistic':
+                    self.exporter.export_logistic_regression(model, f'{name}_v1', model_path)
+                else:
+                    print(f"[WARNING] No export method for model: {name}")
+                    continue
+
+                print(f"[OK] Exported {name} to {model_path}")
+
+            except Exception as e:
+                print(f"[ERROR] Failed to export {name}: {e}")
+
+    def _generate_comparison_report(self) -> None:
+        """
+        Generate a comprehensive model comparison report.
+        """
+        report_path = os.path.join(self.config['metadata_dir'], 'model_comparison_report.md')
+
+        with open(report_path, 'w') as f:
+            f.write("# Football Prediction Model Comparison Report\n")
+            f.write(f"Generated at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+
+            f.write("## Model Performance Summary\n\n")
+            f.write("| Model | Accuracy | Log Loss | Brier Score |\n")
+            f.write("|-------|-----------|----------|--------------|\n")
+
+            for name, result in self.results.items():
+                metrics = self.evaluator.results.get(name, {})
+                accuracy = result.get('accuracy', 0)
+                log_loss = result.get('log_loss', 0)
+                brier = metrics.get('brier_score', 0)
+                f.write(f"| {name.title()} | {accuracy:.4f} | {log_loss:.4f} | {brier:.4f} |\n")
+
+            f.write("\n## Best Model\n\n")
+            f.write(f"**{self.best_model.title()}** with accuracy **{self.best_accuracy:.4f}**\n\n")
+
+            f.write("## Recommendations\n\n")
+            f.write("- Use XGBoost for best accuracy\n")
+            f.write("- Use Logistic Regression for fast inference\n")
+            f.write("- Random Forest provides robust backup\n")
+
+        print(f"[OK] Generated model comparison report: {report_path}")
 
     def _export_best_model(self, input_dim: int) -> None:
         """
@@ -269,3 +379,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+

@@ -1,39 +1,45 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { ConfigModule } from '@nestjs/config';
 
 // Entities
 import { League } from './entities/league.entity';
 import { Team } from './entities/team.entity';
 import { Fixture } from './entities/fixture.entity';
 import { Standing } from './entities/standing.entity';
+import { Injury } from './entities/injury.entity';
 
 // Services
-import { FootballDataApiService } from './services/football-data-api.service';
+import { FootballDataOrgService } from './services/football-data-org.service';
 import { FixtureService } from './services/fixture.service';
 import { TeamService } from './services/team.service';
-import { HistoricalDataService } from './services/historical-data.service';
+import { InjuryService } from './services/injury.service';
+import { StandingsService } from './services/standings.service';
 
 // Controllers
 import { FixtureController } from './controllers/fixture.controller';
 import { TeamController } from './controllers/team.controller';
-import { TrainingDataController } from './controllers/training-data.controller';
 
 @Module({
-  imports: [TypeOrmModule.forFeature([League, Team, Fixture, Standing])],
-  controllers: [FixtureController, TeamController, TrainingDataController],
+  imports: [
+    ConfigModule,
+    TypeOrmModule.forFeature([League, Team, Fixture, Standing, Injury]),
+  ],
+  controllers: [FixtureController, TeamController],
   providers: [
-    FootballDataApiService,
+    FootballDataOrgService,
     FixtureService,
     TeamService,
-    HistoricalDataService,
+    InjuryService,
+    StandingsService,
   ],
   exports: [
-    FootballDataApiService,
+    FootballDataOrgService,
     FixtureService,
     TeamService,
-    HistoricalDataService,
+    InjuryService,
+    StandingsService,
   ],
 })
 export class FootballModule { }
-
 
